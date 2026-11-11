@@ -75,7 +75,9 @@ b_i ~ N(0, sigma_b^2)   e_ij ~ N(0, sigma_e^2)
 ```
 
 Fitted on all 20,546 player-seasons: **sigma_b = 0.90** (spread of player
-levels), **sigma_e = 1.50** (season-to-season noise), **peak age 27**.
+levels) and **sigma_e = 1.50** (season-to-season noise). The fitted career path
+peaks around season 7 / age 27 -- but see **Limits** before reading that as an
+age effect.
 
 **Why the random intercept is the whole point.** Raw average win shares by age
 rise into the late twenties and barely fall afterwards — a 40-year-old looks as
@@ -93,34 +95,72 @@ shrinks it toward the population curve by `n / (n + sigma_e^2/sigma_b^2)` =
 `n / (n + 2.8)`. Three noisy seasons get pulled most of the way back to average;
 twelve seasons keep nearly all of their own level.
 
+### Feeding the comparison sets through it
+
+The two parts of this project are not rivals. Each matcher produces a
+comparison set and a vector of inverse-distance weights; the delta method
+averages those comparisons' year-over-year changes, and the GAMM can take the
+*same* weights and use them to fit whole smooth curves instead
+(`projection.match_weights` -> `GAMM.refit_weighted`). Same comps, same
+weights, different engine.
+
+Because a handful of players cannot support a 68-column basis, the weighted fit
+shrinks toward the global model in proportion to how thin the weighting is:
+
+```
+minimize  ||y - X.beta||^2_W  +  (beta - beta_global)' S (beta - beta_global)
+                              +  tau ||beta - beta_global||^2 ,   tau ~ p / ESS
+```
+
+so a tight comparison set yields a gentle tilt on the population curve rather
+than a wild extrapolation. Without that term the weighted normal equations go
+singular and single-player errors reach 49 win shares.
+
 ### Does it actually help?
 
-`scripts/backtest.py` splits players by identity — the GAMM never sees a test
-player, and the k-NN methods may only draw comparisons from training players.
-Each method sees a player's first *N* seasons and forecasts the rest. Mean
-absolute error in win shares, over 3 cutoffs x 2 seeds:
+`scripts/backtest.py` splits players by identity -- the GAMM never sees a test
+player, and the matchers may only draw comparisons from training players. Mean
+absolute error in win shares:
 
-| Method | MAE | RMSE | bias |
-|---|---|---|---|
-| **GAMM** | **1.33** | 1.75 | +0.14 |
-| League-avg delta *(baseline)* | 2.23 | 2.99 | 0.00 |
-| epsilon-neighbourhood | 2.37 | 3.20 | -0.09 |
-| Standard k-NN | 2.53 | 3.36 | +0.05 |
-| Centroid k-NN | 2.55 | 3.42 | -0.09 |
-| Flat, carry last *(baseline)* | 2.68 | 3.55 | +1.74 |
+| Method | MAE | vs. plain GAMM |
+|---|---|---|
+| **Centroid k-NN -> GAMM** | **1.27** | better |
+| Standard k-NN -> GAMM | 1.27 | better |
+| epsilon-neighbourhood -> GAMM | 1.30 | better |
+| GAMM alone (no comparisons) | 1.32 | — |
+| League-avg delta *(baseline)* | 2.23 | |
+| epsilon-neighbourhood -> delta | 2.37 | |
+| Standard k-NN -> delta | 2.53 | |
+| Centroid k-NN -> delta | 2.55 | |
+| Flat, carry last *(baseline)* | 2.68 | |
 
-Two things to take from this:
+**Routing the same comparison sets through the GAMM cuts their error by about
+44%** (2.55 -> 1.27). The comparison machinery was never the problem; averaging
+one-season deltas was.
 
-1. The GAMM roughly **halves** the error, and its advantage *grows* with
-   horizon — the delta methods accumulate error like a random walk while the
-   GAMM is anchored to a population curve. Its 80% prediction intervals cover
-   78.4% of outcomes (50% -> 51.5%, 95% -> 92.3%).
-2. **All three comparison methods lose to the league-average delta baseline.**
-   The similarity machinery is genuinely interesting for the question "who plays
-   like this player", but as a *forecaster* it adds nothing over applying the
-   population aging curve. The PCA is still doing real work — it enters the
-   GAMM as covariates, and dropping the style terms moves sigma_b from 0.90 to
-   1.80 — it is the nearest-neighbour step that does not pay for itself.
+### How many comparisons?
+
+Five is far too few. Sweeping the comparison-set size through the identical
+pipeline (mean per-player MAE, 3 cutoffs x 2 seeds, paired against the plain
+GAMM):
+
+| k | effective sample | MAE | vs. plain GAMM | t |
+|---|---|---|---|---|
+| 5 | 4.7 | 1.214 | +0.029 | +3.8 *(worse)* |
+| 15 | 13.7 | 1.205 | +0.020 | +2.6 *(worse)* |
+| 40 | 35.9 | 1.177 | -0.008 | -1.1 *(ns)* |
+| **80** | **70.9** | **1.160** | **-0.024** | **-3.4** |
+| 160 | 139.9 | 1.162 | -0.023 | -3.4 |
+
+At k=5 the comparisons make the forecast *worse* than ignoring them. The app
+therefore fits on 80 by default while still showing only the nearest few in the
+table. A smooth kernel over the same distances does slightly better again
+(tricube, bandwidth 2.0: MAE 1.122, -0.058 vs global, t=-9.0), since
+inverse-distance weighting is peaked and has a hard edge at the k-th neighbour.
+
+A varying-coefficient term letting the age curve scale with style
+(`Smooth("Age", by="PC1")`) is statistically significant but practically
+negligible: -0.011 MAE, t=-3.2.
 
 The implementation was cross-checked against R's `mgcv`, the reference GAMM
 package. Fitting the same specification with `bam()` gives sigma_b = 0.9043
@@ -136,9 +176,15 @@ package. Fitting the same specification with `bam()` gives sigma_b = 0.9043
   on still playing*, and retirement is strongly performance-related — a final
   season averages 0.67 win shares against 3.07 otherwise. Expected career value
   needs a companion hazard model.
-- **Smoothing parameters** are chosen by GCV with Nelder-Mead, which sometimes
-  drives a lambda to zero (an unpenalized smooth). It does not hurt the held-out
-  numbers, but REML would be the more principled choice.
+- **Smoothing parameters** are chosen by GCV with Nelder-Mead, and this is the
+  weakest part of the implementation. It drives some lambdas to zero, and it
+  splits the age/experience signal differently from `mgcv`: fitting the same
+  specification with REML in `mgcv` gives age a 6.6 win-share swing from peak to
+  40, while GCV here gives it 0.24 and hands the decline to career season
+  instead. The two are correlated at 0.861, so either can carry it, and
+  forecasts are barely affected -- but **the age curve from this model should
+  not be read as an age effect**, and "peak age 27" is not a claim it supports.
+  Moving to REML is the fix.
 
 ### Rebuilding it
 

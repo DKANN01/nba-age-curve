@@ -67,6 +67,74 @@ def inverse_distance_weights(distances: np.ndarray) -> np.ndarray:
     return weights / total
 
 
+def match_weights(match: NeighborMatch) -> pd.Series:
+    """The comparison set's inverse-distance weights, keyed by player.
+
+    These are exactly the weights ``project_metric`` applies to each
+    comparison's year-over-year changes. Handing the same vector to
+    :meth:`~nba_age_curve.gamm.GAMM.refit_weighted` is what lets a matching
+    method drive the GAMM rather than sitting beside it: the same comp set and
+    the same weights, used to fit whole smooth curves instead of one-season
+    deltas.
+    """
+    if len(match) == 0:
+        return pd.Series(dtype=float)
+    return pd.Series(inverse_distance_weights(match.distances), index=match.ids)
+
+
+def project_with_gamm(
+    model,
+    df: pd.DataFrame,
+    match: NeighborMatch,
+    metric: str,
+    cutoff: int | None = None,
+    n_ahead: int = 8,
+    pc_cols: list[str] | None = None,
+):
+    """Forecast ``metric`` by refitting ``model`` on a comparison set.
+
+    The comparison players (and only they) carry weight in the fit, in
+    proportion to closeness. Because a handful of players cannot support the
+    full basis, ``refit_weighted`` shrinks the result toward the global curve in
+    proportion to how thin the weighting is -- so a tight comp set yields a
+    gentle tilt rather than a wild extrapolation.
+
+    Returns ``(seasons, mean, sd, ess)`` or ``None`` when the set is empty.
+    ``ess`` is the effective number of weighted players, which says how much the
+    comparisons were actually able to move the curve.
+    """
+    cutoff = cutoff or match.n_seasons
+    weights = match_weights(match)
+    if weights.empty:
+        return None
+
+    fit_rows = df.dropna(subset=[metric])
+    row_w = fit_rows["PLAYER_ID"].map(weights).fillna(0.0).to_numpy()
+    if row_w.sum() <= 0:
+        return None
+
+    local = model.refit_weighted(
+        fit_rows,
+        fit_rows[metric].to_numpy(),
+        fit_rows["PLAYER_ID"].to_numpy(),
+        row_w,
+    )
+
+    target = df[df["PLAYER_ID"] == match.target_id]
+    history = target[target["Season_No"] <= cutoff].dropna(subset=[metric])
+    if history.empty:
+        return None
+
+    future = type(model).future_frame(history, n_ahead=n_ahead, pc_cols=pc_cols)
+    if len(future) == 0:
+        return None
+
+    mean, sd = local.forecast(history, future, y_col=metric)
+    w = weights.to_numpy()
+    ess = float(w.sum() ** 2 / max((w**2).sum(), 1e-12))
+    return future["Season_No"].to_numpy(), mean, sd, ess
+
+
 def _delta_table(
     df: pd.DataFrame, player_ids: list[int], metric: str
 ) -> pd.DataFrame:

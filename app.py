@@ -24,7 +24,11 @@ from nba_age_curve.config import GAMM_METHOD, GAMM_PATH, PC_COLS
 from nba_age_curve.data import load_player_seasons, player_directory
 from nba_age_curve.gamm import GAMM
 from nba_age_curve.pca import attach_scores, fit_season_pca
-from nba_age_curve.projection import peer_percentiles, project_metric
+from nba_age_curve.projection import (
+    peer_percentiles,
+    project_metric,
+    project_with_gamm,
+)
 from nba_age_curve.similarity import (
     CENTROID,
     EPSILON,
@@ -53,15 +57,25 @@ METHOD_DASHES = {
     GAMM_METHOD: "solid",
 }
 
-#: Mean absolute error on held-out retired players, from the backtest in
-#: `scripts/backtest.py`. Shown in the UI so the methods are not presented as
-#: equally trustworthy when they measurably are not.
+#: Two ways to turn a comparison set into a forecast.
+ENGINE_GAMM = "Comp-weighted GAMM"
+ENGINE_DELTA = "Delta method"
+
+#: Mean per-player absolute error on held-out retired players, from
+#: `scripts/backtest.py` (3 cutoffs x 2 seeds, players split by identity).
+#: Shown in the UI so the options are not presented as equally trustworthy
+#: when they measurably are not.
 BACKTEST_MAE = {
-    GAMM_METHOD: 1.33,
-    EPSILON: 2.37,
-    STANDARD: 2.53,
-    CENTROID: 2.55,
+    ENGINE_GAMM: 1.16,
+    ENGINE_DELTA: 2.10,
+    GAMM_METHOD: 1.19,
 }
+
+#: Comparison-set size that the weighted GAMM fit uses by default. Five is far
+#: too few to move a 68-column basis -- at k=5 the fit is measurably *worse*
+#: than ignoring comparisons altogether (+0.029 MAE, t=3.8), while k=80 beats
+#: it (-0.024, t=-3.4). The displayed "most similar players" table stays short.
+DEFAULT_FIT_K = 80
 
 
 def rgba(hex_color: str, alpha: float) -> str:
@@ -149,10 +163,38 @@ with st.sidebar:
     if gamm_model is None:
         st.caption("Run `python scripts/fit_gamm.py` to enable the GAMM.")
 
-    st.caption("Comparison-based (MAE in brackets):")
-    use_standard = st.checkbox(f"{STANDARD} ({BACKTEST_MAE[STANDARD]})", value=True)
-    use_centroid = st.checkbox(f"{CENTROID} ({BACKTEST_MAE[CENTROID]})", value=True)
-    use_epsilon = st.checkbox(f"{EPSILON} ({BACKTEST_MAE[EPSILON]})", value=True)
+    st.caption("Comparison-set methods — one line each:")
+    use_standard = st.checkbox(STANDARD, value=True)
+    use_centroid = st.checkbox(CENTROID, value=True)
+    use_epsilon = st.checkbox(EPSILON, value=True)
+
+    engine = st.radio(
+        "Turn each comparison set into a forecast by",
+        options=[ENGINE_GAMM, ENGINE_DELTA],
+        format_func=lambda e: f"{e} (MAE {BACKTEST_MAE[e]})",
+        disabled=gamm_model is None,
+        help=(
+            "Both use the same comparison set and the same inverse-distance "
+            "weights. The delta method averages the comparisons' "
+            "year-over-year changes; the GAMM uses those weights to fit whole "
+            "smooth curves, shrinking toward the population model when the "
+            "set is too thin to support one."
+        ),
+    )
+
+    fit_k = st.slider(
+        "Comparisons used in the GAMM fit",
+        min_value=5,
+        max_value=200,
+        value=DEFAULT_FIT_K,
+        step=5,
+        disabled=engine != ENGINE_GAMM,
+        help=(
+            "How many neighbours carry weight in the weighted fit. Backtested "
+            "optimum is around 80; at 5 the fit is worse than using no "
+            "comparisons at all. This does not change the table below."
+        ),
+    )
 
     gamm_horizon = st.slider(
         "GAMM seasons to project",
@@ -217,10 +259,11 @@ with st.sidebar:
 st.title("NBA Career Projections")
 st.markdown(
     "Pick a player to see the most stylistically similar careers in the modern "
-    f"era, and where four methods project their "
-    f"**{PROJECTABLE_METRICS[metric].lower()}** going forward. The bracketed "
-    "numbers are each method's mean absolute error on held-out players — "
-    "lower is better, and they are not close."
+    f"era, and where each comparison method projects their "
+    f"**{PROJECTABLE_METRICS[metric].lower()}** going forward. Every method "
+    "feeds its comparison set and inverse-distance weights into the same "
+    "forecasting engine, which you can switch in the sidebar — the two "
+    "engines differ in accuracy by about a factor of two."
 )
 
 preferred = directory.loc[directory["PLAYER_NAME"] == "Nikola Jokic", "PLAYER_ID"]
@@ -339,7 +382,21 @@ if show_gamm:
             icon="ℹ️",
         )
 
-matches, projections = {}, {}
+# Each enabled matcher yields one curve. Both engines consume the *same*
+# comparison set and the same inverse-distance weights; they differ only in
+# what they do with them.
+gamm_engine = (
+    engine == ENGINE_GAMM and gamm_model is not None and metric == DEFAULT_METRIC
+)
+if engine == ENGINE_GAMM and not gamm_engine and enabled and gamm_model is not None:
+    st.info(
+        f"The GAMM was fit on {PROJECTABLE_METRICS[DEFAULT_METRIC].lower()}, so "
+        f"the comparison sets fall back to the delta method for "
+        f"{PROJECTABLE_METRICS[metric].lower()}.",
+        icon="ℹ️",
+    )
+
+matches, curves = {}, {}
 for method in enabled:
     match = get_match(method, int(player_id), cutoff, k, epsilon)
     matches[method] = match
@@ -347,6 +404,37 @@ for method in enabled:
         st.warning(f"**{method}** — {note}", icon="⚠️")
     if not len(match):
         continue
+
+    if gamm_engine:
+        # The table shows the nearest few; the fit uses a wider set, because
+        # five players cannot support the basis. The epsilon method defines its
+        # own set by radius, so it is used as-is.
+        fit_match = (
+            match
+            if method == EPSILON
+            else get_match(method, int(player_id), cutoff, fit_k, epsilon)
+        )
+        result = project_with_gamm(
+            gamm_model,
+            df,
+            fit_match,
+            metric,
+            cutoff=cutoff,
+            n_ahead=gamm_horizon,
+            pc_cols=PC_COLS,
+        )
+        if result is None:
+            continue
+        seasons, values, sd, ess = result
+        curves[method] = {
+            "seasons": np.asarray(seasons),
+            "values": np.asarray(values),
+            "sd": np.asarray(sd),
+            "ess": ess,
+            "n_fit": len(fit_match),
+        }
+        continue
+
     try:
         projection = project_metric(
             df, match, metric, cutoff=cutoff, min_support=min_support
@@ -355,7 +443,6 @@ for method in enabled:
         st.warning(f"**{method}** — {exc}", icon="⚠️")
         continue
 
-    projections[method] = projection
     if len(projection) == 0:
         plural = "s" if len(match) != 1 else ""
         st.info(
@@ -365,6 +452,14 @@ for method in enabled:
             "widen ε, or pick an earlier cutoff.",
             icon="ℹ️",
         )
+        continue
+
+    curves[method] = {
+        "seasons": np.asarray(projection.seasons),
+        "values": np.asarray(projection.values),
+        "sd": np.asarray(projection.spread),
+        "support": projection.neighbors_used,
+    }
 
 st.subheader(f"Projected {PROJECTABLE_METRICS[metric].lower()}")
 
@@ -435,19 +530,21 @@ figure.add_trace(
     )
 )
 
-for method, projection in projections.items():
-    if len(projection) == 0:
-        continue
-    frame = projection.to_frame()
+anchor_y = float(history.loc[history["Season_No"] == cutoff, metric].iloc[0])
+
+for method, curve in curves.items():
     color = METHOD_COLORS[method]
+    # Prepend the anchor season so every line starts where the player is.
+    xs = np.concatenate([[cutoff], curve["seasons"]])
+    ys = np.concatenate([[anchor_y], curve["values"]])
+    sd = np.concatenate([[0.0], curve["sd"]])
 
     if show_band:
-        upper = frame[metric] + frame["spread"]
-        lower = frame[metric] - frame["spread"]
+        width = 1.2816 if gamm_engine else 1.0
         figure.add_trace(
             go.Scatter(
-                x=list(frame["Season_No"]) + list(frame["Season_No"][::-1]),
-                y=list(upper) + list(lower[::-1]),
+                x=np.concatenate([xs, xs[::-1]]),
+                y=np.concatenate([ys + width * sd, (ys - width * sd)[::-1]]),
                 fill="toself",
                 fillcolor=rgba(color, 0.15),
                 mode="lines",
@@ -457,20 +554,35 @@ for method, projection in projections.items():
             )
         )
 
+    if gamm_engine:
+        n_fit = curve["n_fit"]
+        detail = f"{n_fit} comp{'' if n_fit == 1 else 's'}, ESS {curve['ess']:.0f}"
+        extra = np.full(len(xs), curve["ess"])
+        hover = (
+            "Season %{x}: %{y:.1f}"
+            "<br>effective comps: %{customdata:.0f}"
+            f"<extra>{method} → GAMM</extra>"
+        )
+    else:
+        n_c = len(matches[method])
+        detail = f"{n_c} comp{'' if n_c == 1 else 's'}"
+        extra = np.concatenate([[0], curve["support"]])
+        hover = (
+            "Season %{x}: %{y:.1f}"
+            "<br>%{customdata:.0f} comparisons"
+            f"<extra>{method} → delta</extra>"
+        )
+
     figure.add_trace(
         go.Scatter(
-            x=frame["Season_No"],
-            y=frame[metric],
+            x=xs,
+            y=ys,
             mode="lines+markers",
             line={"color": color, "width": 3, "dash": METHOD_DASHES[method]},
             marker={"size": 7},
-            name=method,
-            customdata=frame[["neighbors_used"]],
-            hovertemplate=(
-                "Season %{x}: %{y:.1f}"
-                "<br>%{customdata[0]} comparisons"
-                f"<extra>{method}</extra>"
-            ),
+            name=f"{method} — {detail}",
+            customdata=extra,
+            hovertemplate=hover,
         )
     )
 
@@ -525,7 +637,7 @@ figure.add_vline(
 
 upper_x = max(
     [career_length]
-    + [max(p.seasons) for p in projections.values() if len(p)]
+    + [int(c["seasons"].max()) for c in curves.values() if len(c["seasons"])]
     + ([int(gamm_forecast[0].max())] if gamm_forecast is not None else [])
 )
 figure.update_layout(
@@ -539,35 +651,39 @@ figure.update_layout(
 )
 st.plotly_chart(figure, width="stretch")
 
-if projections or gamm_forecast is not None:
+if curves or gamm_forecast is not None:
     summary = []
     if gamm_forecast is not None:
         gs, gmean, gsd = gamm_forecast
         row = {
-            "Method": GAMM_METHOD,
+            "Method": f"{GAMM_METHOD} (no comps)",
             "Seasons projected": len(gs),
             "Next season": round(float(gmean[0]), 2),
             "Final projected": round(float(gmean[-1]), 2),
         }
         if metric not in RATE_METRICS:
             row["Remaining total"] = round(float(gmean.sum()), 1)
+        row["Effective comps"] = 0
         row["Backtest MAE"] = BACKTEST_MAE[GAMM_METHOD]
         summary.append(row)
 
-    for method, projection in projections.items():
-        if len(projection) == 0:
-            continue
+    for method, curve in curves.items():
+        values = curve["values"]
         row = {
-            "Method": method,
-            "Seasons projected": len(projection),
-            "Next season": round(projection.values[0], 2),
-            "Final projected": round(projection.values[-1], 2),
+            "Method": f"{method} → {'GAMM' if gamm_engine else 'delta'}",
+            "Seasons projected": len(values),
+            "Next season": round(float(values[0]), 2),
+            "Final projected": round(float(values[-1]), 2),
         }
         # A remaining-career total is only meaningful for counting stats.
         if metric not in RATE_METRICS:
-            row["Remaining total"] = round(sum(projection.values), 1)
-        row["Thinnest support"] = min(projection.neighbors_used)
-        row["Backtest MAE"] = BACKTEST_MAE[method]
+            row["Remaining total"] = round(float(np.sum(values)), 1)
+        row["Effective comps"] = (
+            round(curve["ess"], 1) if gamm_engine else min(curve["support"])
+        )
+        row["Backtest MAE"] = BACKTEST_MAE[
+            ENGINE_GAMM if gamm_engine else ENGINE_DELTA
+        ]
         summary.append(row)
     if summary:
         st.dataframe(
@@ -654,11 +770,24 @@ differently, so treat agreement between them as the signal:
   few or none, which is the honest answer where k-NN would hand back five
   distant players and call them neighbours.
 
-**The comparison-based projection is a path of changes, not levels.** For each
-future season it takes the year-over-year change each comparison player made at
-that point in *their* career, weights it by 1/distance, and adds it to a running
-total that starts at the player's actual current value. So it inherits the
-*shape* of its comparisons' careers, never their level.
+**Two engines, one comparison set.** Each matcher produces a set of comparison
+players and a vector of inverse-distance weights. Both engines consume exactly
+those:
+
+- *{ENGINE_DELTA}* takes the year-over-year change each comparison made at that
+  point in *their* career, weights it by 1/distance, and adds it to a running
+  total starting from the player's current value. It inherits the shape of its
+  comparisons' careers but accumulates error like a random walk.
+- *{ENGINE_GAMM}* hands the same weights to the additive model and refits the
+  whole curve, shrinking toward the population model in proportion to how thin
+  the weighting is. Routing the same comparisons through it cuts their error by
+  about 44% (2.55 → 1.27 MAE).
+
+**Comparison-set size matters more than which matcher you use.** Five players
+cannot support a 68-column basis: at k=5 the comparisons make the forecast
+*worse* than ignoring them (+0.029 MAE, t=3.8), while k=80 beats the plain
+model (−0.024, t=−3.4). The sidebar fits on 80 by default; the table below
+still lists only the nearest few.
 
 **The GAMM works differently, and forecasts about twice as well.** It is an
 additive model with penalized smooth curves in age, career season, era and
@@ -668,7 +797,9 @@ playing style, plus a random intercept for every player. Two things follow:
   barely fall after 30, which would say players hardly decline. That is
   survivorship — only the good ones are still playing at 36. The random
   intercept absorbs each player's own level so the age curve is estimated from
-  *within-player* change. Peak age comes out at 27.
+  *within-player* change. Note that age and career season are correlated at
+  0.861 and this fit hands most of the decline to career season, so the curve
+  below is a career-stage effect, not a clean age effect.
 - *It pools partially.* A player's level is estimated from their seasons and
   shrunk toward the population curve by `n / (n + 2.8)`, so a player
   with three noisy seasons is pulled most of the way back to average while one

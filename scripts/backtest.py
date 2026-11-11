@@ -30,7 +30,7 @@ from nba_age_curve.config import GAMM_SMOOTHS, N_COMPONENTS  # noqa: E402
 from nba_age_curve.data import load_player_seasons  # noqa: E402
 from nba_age_curve.gamm import GAMM, Smooth  # noqa: E402
 from nba_age_curve.pca import attach_scores, fit_season_pca  # noqa: E402
-from nba_age_curve.projection import project_metric  # noqa: E402
+from nba_age_curve.projection import match_weights, project_metric  # noqa: E402
 from nba_age_curve.similarity import (  # noqa: E402
     CENTROID,
     EPSILON,
@@ -41,7 +41,7 @@ from nba_age_curve.similarity import (  # noqa: E402
 )
 
 
-def run_split(df, cutoff: int, seed: int, metric: str) -> pd.DataFrame:
+def run_split(df, cutoff: int, seed: int, metric: str, fit_k: int = 80) -> pd.DataFrame:
     lengths = df.groupby("PLAYER_ID")["Season_No"].max()
     last_year = df.groupby("PLAYER_ID")["SEASON_YEAR"].max()
     # Retired players only: their futures are known, so they can be scored.
@@ -82,6 +82,8 @@ def run_split(df, cutoff: int, seed: int, metric: str) -> pd.DataFrame:
             rows.append(("League-avg delta", pid, s, actual, running, np.nan))
 
         pool = df[df["PLAYER_ID"].isin(train_ids | {pid})]
+        train_pid = train["PLAYER_ID"].to_numpy()
+        train_y = train[metric].to_numpy()
         for label, fn, kw in (
             (STANDARD, match_standard_knn, {}),
             (CENTROID, match_centroid_knn, {}),
@@ -96,7 +98,29 @@ def run_split(df, cutoff: int, seed: int, metric: str) -> pd.DataFrame:
                 continue
             for s, v in zip(proj.seasons, proj.values):
                 if s in truth:
-                    rows.append((label, pid, s, truth[s], v, np.nan))
+                    rows.append((f"{label} -> delta", pid, s, truth[s], v, np.nan))
+
+            # The same comparison set and weights, fed to the GAMM instead.
+            # Epsilon defines its own set by radius; the k-NN methods are
+            # widened to fit_k, since five players cannot support the basis.
+            try:
+                fit_match = (
+                    match
+                    if label == EPSILON
+                    else fn(pool, int(pid), cutoff, k=fit_k, **kw)
+                )
+                weights = match_weights(fit_match)
+                row_w = pd.Series(train_pid).map(weights).fillna(0.0).to_numpy()
+                if row_w.sum() <= 0:
+                    continue
+                local = model.refit_weighted(train, train_y, train_pid, row_w)
+                mean, sd = local.forecast(hist, future, y_col=metric)
+            except (ValueError, KeyError, np.linalg.LinAlgError):
+                continue
+            for s, m_, sd_, actual in zip(
+                future["Season_No"], mean, sd, future[metric]
+            ):
+                rows.append((f"{label} -> GAMM", pid, s, actual, m_, sd_))
 
     out = pd.DataFrame(rows, columns=["method", "PLAYER_ID", "Season_No",
                                       "actual", "pred", "sd"])
@@ -109,13 +133,16 @@ def main() -> None:
     ap.add_argument("--cutoff", type=int, nargs="+", default=[3, 5, 8])
     ap.add_argument("--seeds", type=int, nargs="+", default=[42, 7])
     ap.add_argument("--metric", default="ws")
+    ap.add_argument("--fit-k", type=int, default=80,
+                    help="Comparisons used in the weighted GAMM fit (default 80).")
     args = ap.parse_args()
 
     df = load_player_seasons()
     df = attach_scores(df, fit_season_pca(df), N_COMPONENTS)
     df = df.dropna(subset=[args.metric])
 
-    frames = [run_split(df, c, s, args.metric) for c in args.cutoff for s in args.seeds]
+    frames = [run_split(df, c, s, args.metric, args.fit_k)
+              for c in args.cutoff for s in args.seeds]
     res = pd.concat(frames, ignore_index=True)
     res["err"] = res["pred"] - res["actual"]
     res["horizon"] = res["Season_No"] - res["cutoff"]

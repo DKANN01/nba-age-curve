@@ -214,3 +214,51 @@ def match_epsilon(
 
 
 MATCHERS = {STANDARD: match_standard_knn, CENTROID: match_centroid_knn}
+
+
+def centroid_distances(
+    df: pd.DataFrame, target_id: int, n_seasons: int | None = None
+) -> pd.Series:
+    """Distance from every eligible player's centroid to the target's.
+
+    The same quantity the centroid matcher ranks on, returned in full rather
+    than truncated to the nearest k.
+    """
+    n_seasons = n_seasons or _target_n_seasons(df, target_id)
+    centroids = _centroids(df, n_seasons)
+    target = centroids.loc[centroids["PLAYER_ID"] == target_id, PC_COLS]
+    if target.empty:
+        raise KeyError(f"PLAYER_ID {target_id} has no centroid at season {n_seasons}")
+    offsets = centroids[PC_COLS].to_numpy() - target.to_numpy()[0]
+    return pd.Series(
+        np.linalg.norm(offsets, axis=1), index=centroids["PLAYER_ID"].to_numpy()
+    )
+
+
+def similarity_weights(
+    df: pd.DataFrame,
+    target_id: int,
+    n_seasons: int | None = None,
+    bandwidth: float = 1.0,
+    kernel: str = "gaussian",
+) -> pd.Series:
+    """Per-player weights falling off with distance from the target's style.
+
+    This is the soft version of a comparison set. ``tophat`` reproduces the
+    hard "these five players and nobody else" rule; ``gaussian`` and ``tricube``
+    let everyone contribute in proportion to similarity, which keeps the fit
+    estimable while still tilting it toward the players who look like the
+    target. ``bandwidth`` controls how local the fit is -- as it grows, the
+    weights flatten and the result converges on the global model.
+    """
+    d = centroid_distances(df, target_id, n_seasons)
+    u = d / max(bandwidth, 1e-9)
+    if kernel == "gaussian":
+        w = np.exp(-(u**2))
+    elif kernel == "tricube":
+        w = np.where(u < 1, (1 - np.clip(u, 0, 1) ** 3) ** 3, 0.0)
+    elif kernel == "tophat":
+        w = (u <= 1).astype(float)
+    else:
+        raise ValueError(f"unknown kernel {kernel!r}")
+    return pd.Series(w, index=d.index)

@@ -65,16 +65,28 @@ def _difference_penalty(n: int, order: int = 2) -> np.ndarray:
 
 @dataclass
 class Smooth:
-    """One penalized spline term."""
+    """One penalized spline term, optionally a varying-coefficient term.
+
+    With ``by`` set, the basis is multiplied by that column, so the term is
+    ``f(x) * by`` rather than ``f(x)``: the shape of the curve scales with
+    another variable. ``Smooth("Age", by="PC1")`` lets the aging curve differ
+    between the two ends of PC1 -- bigs declining on a different schedule from
+    guards -- which a plain additive ``s(Age) + s(PC1)`` cannot express.
+    """
 
     name: str
     n_knots: int = 10
     degree: int = 3
+    by: str | None = None
     knots_: np.ndarray | None = None
     center_: np.ndarray | None = None
     cols_: tuple[int, int] | None = None
 
-    def basis(self, x: np.ndarray, fit: bool = False) -> np.ndarray:
+    @property
+    def label(self) -> str:
+        return self.name if self.by is None else f"{self.name}:{self.by}"
+
+    def basis(self, x, by_values=None, fit: bool = False) -> np.ndarray:
         x = np.asarray(x, dtype=float)
         if fit:
             self.knots_ = np.unique(np.quantile(x, np.linspace(0, 1, self.n_knots)))
@@ -83,7 +95,10 @@ class Smooth:
             # Centre on the TRAINING mean and reuse it at predict time. Centring
             # each batch on its own mean would silently shift predictions.
             self.center_ = b.mean(axis=0)
-        return b - self.center_
+        b = b - self.center_
+        if self.by is not None:
+            b = b * np.asarray(by_values, dtype=float)[:, None]
+        return b
 
     @property
     def size(self) -> int:
@@ -109,7 +124,8 @@ class GAMM:
     def design(self, frame, fit: bool = False) -> np.ndarray:
         blocks, pos = [], 1  # column 0 is the global intercept
         for s in self.smooths:
-            b = s.basis(np.asarray(frame[s.name]), fit=fit)
+            by = np.asarray(frame[s.by]) if s.by is not None else None
+            b = s.basis(np.asarray(frame[s.name]), by, fit=fit)
             if fit:
                 s.cols_ = (pos, pos + b.shape[1])
             pos += b.shape[1]
@@ -125,16 +141,36 @@ class GAMM:
         return S
 
     def _solve(self, X, y, S):
-        A = X.T @ X + S
-        beta = np.linalg.solve(A, X.T @ y)
-        edf = float(np.trace(np.linalg.solve(A, X.T @ X)))
+        XtX = X.T @ X
+        A = XtX + S
+        # GCV will happily drive a lambda to zero, and with varying-coefficient
+        # terms the basis is close to collinear (f(Age) and f(Age)*PC1 share
+        # their marginal). Either can make A singular, so carry a nugget that is
+        # negligible against A's own scale, and fall back to a pseudo-inverse.
+        A = A + np.eye(A.shape[0]) * (1e-9 * max(np.trace(A), 1.0) / A.shape[0])
+        try:
+            beta = np.linalg.solve(A, X.T @ y)
+            edf = float(np.trace(np.linalg.solve(A, XtX)))
+        except np.linalg.LinAlgError:
+            pinv = np.linalg.pinv(A)
+            beta = pinv @ (X.T @ y)
+            edf = float(np.trace(pinv @ XtX))
+        if not np.isfinite(beta).all():
+            pinv = np.linalg.pinv(A)
+            beta = pinv @ (X.T @ y)
+            edf = float(np.trace(pinv @ XtX))
         return beta, edf, A
 
     def _gcv(self, X, y, log_lam):
-        beta, edf, _ = self._solve(X, y, self._penalty(np.exp(log_lam)))
+        # Nelder-Mead probes extreme lambdas; a failure there is a bad proposal,
+        # not a bad model, so score it as infinitely bad rather than crashing.
+        try:
+            beta, edf, _ = self._solve(X, y, self._penalty(np.exp(np.clip(log_lam, -30, 30))))
+        except np.linalg.LinAlgError:
+            return np.inf
         rss = float(((y - X @ beta) ** 2).sum())
-        n = len(y)
-        return n * rss / max(n - edf, 1e-6) ** 2
+        score = len(y) * rss / max(len(y) - edf, 1e-6) ** 2
+        return score if np.isfinite(score) else np.inf
 
     # -- fitting ------------------------------------------------------------
     def fit(self, frame, y, groups) -> "GAMM":
@@ -196,6 +232,76 @@ class GAMM:
         self.sigma_b_, self.sigma_e_ = float(np.sqrt(s_b2)), float(np.sqrt(s_e2))
         self.group_effects_ = dict(zip(levels.tolist(), b.tolist()))
         return self
+
+    # -- locally weighted refit ---------------------------------------------
+    def refit_weighted(self, frame, y, groups, weights) -> "GAMM":
+        """Refit the curves with per-row weights, reusing basis and penalties.
+
+        This is what turns a comparison set into a *model*. Rather than picking
+        five neighbours and averaging their year-over-year changes, every player
+        in the league contributes to the fit in proportion to how similar they
+        are to the target -- a locally weighted regression in style space. The
+        weighted-average-of-deltas is the degenerate case: a top-hat kernel over
+        five players, fit one season at a time with no smoothing.
+
+        Knots, smoothing parameters and variance components are held at their
+        values from the global fit. They describe the population, and
+        re-estimating them from a reweighted subsample is noisy and slow; fixing
+        them makes this a couple of linear solves, fast enough to run per query.
+        """
+        y = np.asarray(y, dtype=float)
+        w = np.asarray(weights, dtype=float)
+        X = self.design(frame)
+        S = self._penalty(self.lambdas_)
+
+        levels, gidx = np.unique(np.asarray(groups), return_inverse=True)
+        wsum = np.bincount(gidx, weights=w, minlength=len(levels))
+        ratio = self.sigma_e_**2 / self.sigma_b_**2
+
+        local = GAMM(smooths=self.smooths, max_iter=self.max_iter, tol=self.tol)
+        local.lambdas_ = self.lambdas_
+        local.sigma_b_, local.sigma_e_ = self.sigma_b_, self.sigma_e_
+
+        Xw = X * w[:, None]
+        XwX = Xw.T @ X
+        p = X.shape[1]
+
+        # Shrink the local fit toward the global one, hard when the kernel is
+        # concentrated. Effective sample size (Kish) says how many rows the
+        # weights are really worth: when that approaches the number of basis
+        # columns the weighted normal equations are near-singular and the
+        # coefficients explode, so tau grows to pull beta back to the global
+        # solution. With diffuse weights tau is negligible and this is an
+        # ordinary weighted fit.
+        ess = float(w.sum() ** 2 / max((w**2).sum(), 1e-12))
+        tau = (p / max(ess, 1.0)) * float(np.mean(np.diag(XwX)))
+        A = XwX + S + np.eye(p) * (tau + 1e-9 * max(np.trace(XwX), 1.0) / p)
+        anchor = (S + np.eye(p) * tau) @ self.beta_
+
+        b = np.zeros(len(levels))
+        beta = self.beta_.copy()
+        for _ in range(self.max_iter):
+            rhs = Xw.T @ (y - b[gidx]) + anchor
+            try:
+                beta = np.linalg.solve(A, rhs)
+            except np.linalg.LinAlgError:
+                beta = np.linalg.pinv(A) @ rhs
+            if not np.isfinite(beta).all():
+                beta = self.beta_.copy()
+                break
+            resid = y - X @ beta
+            b_new = np.bincount(gidx, weights=w * resid, minlength=len(levels)) / (
+                wsum + ratio
+            )
+            if np.max(np.abs(b_new - b)) < self.tol:
+                b = b_new
+                break
+            b = b_new
+
+        local.beta_ = beta
+        local.vbeta_ = self.vbeta_  # population-level, not re-derived
+        local.group_effects_ = dict(zip(levels.tolist(), b.tolist()))
+        return local
 
     # -- prediction ---------------------------------------------------------
     def predict_fixed(self, frame) -> np.ndarray:
@@ -280,6 +386,10 @@ class GAMM:
             "sigma_e": self.sigma_e_,
             "names": np.array([s.name for s in self.smooths]),
             "degrees": np.array([s.degree for s in self.smooths]),
+            # "" stands in for None: npz has no null, and a varying-coefficient
+            # term that lost its `by` on reload would silently become a plain
+            # smooth with the wrong coefficients.
+            "bys": np.array([s.by or "" for s in self.smooths]),
         }
         for i, s in enumerate(self.smooths):
             payload[f"knots_{i}"] = s.knots_
@@ -290,9 +400,11 @@ class GAMM:
     @classmethod
     def load(cls, path) -> "GAMM":
         z = np.load(path, allow_pickle=False)
+        bys = z["bys"] if "bys" in z.files else [""] * len(z["names"])
         smooths = []
         for i, name in enumerate(z["names"]):
-            s = Smooth(name=str(name), degree=int(z["degrees"][i]))
+            s = Smooth(name=str(name), degree=int(z["degrees"][i]),
+                       by=str(bys[i]) or None)
             s.knots_ = z[f"knots_{i}"]
             s.center_ = z[f"center_{i}"]
             s.cols_ = tuple(int(v) for v in z[f"cols_{i}"])

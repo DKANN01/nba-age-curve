@@ -239,6 +239,15 @@ with st.sidebar:
         value=True,
         help="±1 SD of the comparison players' year-over-year changes.",
     )
+    show_fit = st.checkbox(
+        "Show model fit over seasons played",
+        value=True,
+        help=(
+            "The model's estimate of the player's level for seasons already "
+            "played. Shows how much of the step into the forecast is the "
+            "model's level rather than predicted decline."
+        ),
+    )
     show_peers = st.checkbox("Show comparison players' careers", value=False)
     show_league = st.checkbox("Show league percentiles", value=True)
 
@@ -531,6 +540,30 @@ figure.add_trace(
 )
 
 anchor_y = float(history.loc[history["Season_No"] == cutoff, metric].iloc[0])
+
+# The model's fitted level across the seasons already played. Without this the
+# chart jumps from the player's last actual season straight to the first
+# forecast and reads as a predicted collapse, when most of that step is simply
+# the model's estimate of the player's level sitting below a peak season. Drawn
+# in, the forecast is visibly a continuation of a line that was always there.
+if show_fit and gamm_model is not None and metric == DEFAULT_METRIC:
+    seen = history[history["Season_No"] <= cutoff]
+    level, _ = gamm_model.blup(
+        seen[metric].to_numpy() - gamm_model.predict_fixed(seen)
+    )
+    fitted = gamm_model.predict_fixed(history) + level
+    figure.add_trace(
+        go.Scatter(
+            x=history["Season_No"],
+            y=fitted,
+            mode="lines",
+            line={"color": "#777777", "width": 2, "dash": "dot"},
+            name="model fit (seasons played)",
+            hovertemplate=(
+                "Season %{x}: %{y:.1f}<extra>Model's level</extra>"
+            ),
+        )
+    )
 
 for method, curve in curves.items():
     color = METHOD_COLORS[method]

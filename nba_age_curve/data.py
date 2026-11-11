@@ -10,12 +10,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from nba_age_curve.config import (
-    DATASET_PATH,
-    FEATURES,
-    FIRST_SEASON,
-    PRE_1980_PATH,
-)
+from nba_age_curve.config import DATASET_PATH, DEBUT_PATH, FEATURES
 
 
 def season_end_year(season: pd.Series) -> pd.Series:
@@ -23,37 +18,64 @@ def season_end_year(season: pd.Series) -> pd.Series:
     return season.str.slice(0, 4).astype(int) + 1
 
 
-def add_season_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ``Season_No``: the 1-based index of each season within a career.
+def load_debut_years() -> pd.DataFrame | None:
+    """Each player's true first professional season, if the table is present.
 
-    This counts *seasons played*, not years elapsed. A player who misses a full
-    season has that gap collapsed, so season 5 means "fifth season on the
-    floor". Career trajectories are compared on this index.
+    Built by ``scripts/build_dataset.py --master`` from the master workbook's
+    ``year_min``, which records the real debut including ABA seasons.
+    """
+    if not DEBUT_PATH.exists():
+        return None
+    return pd.read_csv(DEBUT_PATH)
+
+
+def add_season_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ``Season_No``: the 1-based *career year* of each season.
+
+    This counts years since the player's true professional debut, not rows in
+    this dataset. The distinction matters because the data starts at 1979-80:
+    counting rows would make Kareem Abdul-Jabbar's 1979-80 his rookie season
+    when it was his eleventh, and would line him up against actual rookies.
+
+    Two consequences follow. A player who misses a season leaves a gap in the
+    index rather than having it collapsed, which is the honest representation
+    and which the projection code already handles (it only differences across
+    genuinely consecutive years). And a player who debuted before the data
+    begins simply has no low career years, so they drop out of early-career
+    comparisons on their own instead of polluting them.
+
+    Where no debut year is known, the first observed season is used, which
+    reduces to the old row-counting behaviour.
     """
     df = df.sort_values(["PLAYER_ID", "SEASON"]).copy()
-    df["Season_No"] = df.groupby("PLAYER_ID").cumcount() + 1
+    debuts = load_debut_years()
+    first_seen = df.groupby("PLAYER_ID")["SEASON_YEAR"].transform("min")
+
+    if debuts is None:
+        debut_year = first_seen
+    else:
+        mapped = df["PLAYER_ID"].map(
+            debuts.set_index("PLAYER_ID")["debut_year"]
+        )
+        debut_year = mapped.fillna(first_seen).astype(int)
+
+    df["debut_year"] = debut_year
+    df["Season_No"] = df["SEASON_YEAR"] - debut_year + 1
     return df
 
 
 def flag_left_censored(df: pd.DataFrame) -> pd.DataFrame:
-    """Mark players whose careers started before the data does.
+    """Mark players whose careers began before this dataset does.
 
-    The source data begins at 1979-80, so for a player already in the league by
-    then, ``Season_No`` understates their true experience. Two signals are
-    combined: a curated list of confirmed pre-1980 debuts, plus the fallback
-    heuristic that *any* player whose first observed season is 1979-80 may have
-    debuted earlier. Flagged players are kept, not dropped -- the app labels
-    them wherever they turn up as a comparison.
+    With true debut years available this is exact rather than heuristic: a
+    player is censored when they debuted before their first season here, so
+    their early career is missing however it is indexed. They are kept, not
+    dropped -- their later seasons are correctly placed on the career-year
+    axis, and the app labels them wherever they appear.
     """
-    first_season = df.groupby("PLAYER_ID")["SEASON"].transform("min")
-    censored = first_season == FIRST_SEASON
-
-    if PRE_1980_PATH.exists():
-        known = set(pd.read_csv(PRE_1980_PATH)["PLAYER_NAME"])
-        censored |= df["PLAYER_NAME"].isin(known)
-
     df = df.copy()
-    df["left_censored"] = censored
+    first_seen = df.groupby("PLAYER_ID")["SEASON_YEAR"].transform("min")
+    df["left_censored"] = df["debut_year"] < first_seen
     return df
 
 
@@ -103,19 +125,26 @@ def load_player_seasons(path=None) -> pd.DataFrame:
 
 
 def career_lengths(df: pd.DataFrame) -> pd.Series:
-    """Total seasons played, indexed by ``PLAYER_ID``."""
+    """Career span in years, indexed by ``PLAYER_ID``.
+
+    This is the last career year observed, so for a player whose early seasons
+    predate the dataset it exceeds the number of seasons present here.
+    """
     return df.groupby("PLAYER_ID")["Season_No"].max()
 
 
 def first_n_seasons(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    """Rows covering the first ``n`` seasons of every player who played ``n``.
+    """Rows covering career years 1..``n`` for players observed over all of them.
 
-    Restricting to players who reached season ``n`` is what makes the comparison
-    fair: a target five seasons into their career is matched against other
-    players' first five seasons, not against careers that ended after two.
+    Two conditions, both needed for a fair comparison. The player must have
+    *reached* career year ``n``, so a target five years in is not matched
+    against careers that ended after two. And the player must be observed from
+    career year 1, which excludes anyone who debuted before this dataset
+    begins -- their early seasons are missing, so there is nothing to compare
+    against however the index is computed.
     """
-    lengths = career_lengths(df)
-    eligible = lengths.index[lengths >= n]
+    span = df.groupby("PLAYER_ID")["Season_No"].agg(["min", "max"])
+    eligible = span.index[(span["min"] == 1) & (span["max"] >= n)]
     return df[df["PLAYER_ID"].isin(eligible) & (df["Season_No"] <= n)]
 
 
@@ -146,6 +175,7 @@ def player_directory(df: pd.DataFrame) -> pd.DataFrame:
         first_season=("SEASON", "min"),
         last_season=("SEASON", "max"),
         seasons=("Season_No", "max"),
+        observed=("SEASON", "size"),
         left_censored=("left_censored", "max"),
     )
     directory["is_active"] = directory["last_season"] == latest_season

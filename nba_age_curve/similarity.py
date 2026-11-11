@@ -67,6 +67,25 @@ class NeighborMatch:
         return len(self.neighbors)
 
 
+class TargetNotComparable(ValueError):
+    """The target has no observed early career, so "first n years" is undefined.
+
+    Raised for players who debuted before the dataset begins. Their later
+    seasons sit correctly on the career-year axis, but there is nothing to
+    match on, because the window every other player is compared over simply
+    was not recorded for them.
+    """
+
+
+def _require_in_pool(frame: pd.DataFrame, target_id: int, n_seasons: int) -> None:
+    if target_id not in set(frame["PLAYER_ID"]):
+        raise TargetNotComparable(
+            f"This player's record starts partway through their career, so "
+            f"their first {n_seasons} years are not in the data and cannot be "
+            f"compared."
+        )
+
+
 def _target_n_seasons(df: pd.DataFrame, target_id: int) -> int:
     seasons = df.loc[df["PLAYER_ID"] == target_id, "Season_No"]
     if seasons.empty:
@@ -120,6 +139,7 @@ def match_standard_knn(
     n_seasons = n_seasons or _target_n_seasons(df, target_id)
     subset = first_n_seasons(df, n_seasons)
     careers = aggregate_careers(subset, FEATURES).reset_index(drop=True)
+    _require_in_pool(careers, target_id, n_seasons)
 
     warnings: list[str] = []
     if len(careers) <= N_COMPONENTS:
@@ -164,6 +184,7 @@ def match_centroid_knn(
     """Match on centroids in the fixed, global season-level PC space."""
     n_seasons = n_seasons or _target_n_seasons(df, target_id)
     centroids = _centroids(df, n_seasons)
+    _require_in_pool(centroids, target_id, n_seasons)
 
     if len(centroids) < 2:
         return NeighborMatch(
@@ -189,10 +210,9 @@ def match_epsilon(
     """Return every player whose centroid lies within ``epsilon`` of the target."""
     n_seasons = n_seasons or _target_n_seasons(df, target_id)
     centroids = _centroids(df, n_seasons)
+    _require_in_pool(centroids, target_id, n_seasons)
 
     target_row = centroids.loc[centroids["PLAYER_ID"] == target_id, PC_COLS]
-    if target_row.empty:
-        raise KeyError(f"PLAYER_ID {target_id} has no centroid at season {n_seasons}")
 
     offsets = centroids[PC_COLS].to_numpy() - target_row.to_numpy()[0]
     centroids = centroids.assign(distance=np.linalg.norm(offsets, axis=1))

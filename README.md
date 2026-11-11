@@ -64,11 +64,16 @@ their level. A player outperforming all their comps keeps that gap.
 - **Support thins out fast.** Hover any projected point to see how many
   comparisons are still behind it. The minimum-support slider cuts the line off
   once it drops too low; without it, a long projection can ride on one peer.
-- **`Season_No` counts seasons *played*, not years elapsed**, so a missed season
-  is collapsed rather than represented as a gap.
-- **Pre-1980 debuts are left-censored.** The data starts at 1979-80, so for the
-  ~300 players already in the league by then, "career season 1" is not their
-  rookie year. They are kept but flagged ⚠ wherever they appear.
+- **Career year is years since the player's true debut**, not a count of rows.
+  The debut comes from the master record's `year_min`, which includes ABA
+  seasons, so Kareem Abdul-Jabbar's 1979-80 is career year 11 rather than a
+  rookie season. A missed season therefore leaves a real gap in the index
+  rather than being collapsed; 660 players have at least one.
+- **Pre-1980 debuts are left-censored.** 237 players were already in the league
+  when the data starts. Their seasons sit correctly on the career-year axis,
+  but their early years are missing, so they are excluded from comparison
+  pools rather than matched at the wrong career stage, and cannot themselves
+  be used as a comparison target.
 - **Style similarity is not quality similarity.** Two players can sit at the
   same point in this space and be very different players. The model has no idea
   who is good — it only knows who plays alike.
@@ -95,6 +100,10 @@ public dashboard shouldn't depend on a third-party URL on every cold start.
 pip install -r requirements-dev.txt
 python scripts/build_dataset.py                      # from the Google Sheet
 python scripts/build_dataset.py --source local.xlsx  # or a local copy
+
+# re-derive true debut years from the master workbook (updates
+# data/debut_years.csv, which is committed so the build needs it only once)
+python scripts/build_dataset.py --master ../nba_age_curve_master.xlsx
 ```
 
 ### Regenerating the PCA figures
@@ -132,7 +141,7 @@ scripts/
   analysis.py               Exploratory PCA figures and component extremes
 data/
   player_seasons.parquet    Baked dataset (committed)
-  pre_1980_debuts.csv       Confirmed pre-1980 debuts, for the censoring flag
+  debut_years.csv           True debut year per player, for career-year indexing
 ```
 
 ## Notes on the original script

@@ -23,6 +23,7 @@ from nba_age_curve.data import load_player_seasons, player_directory
 from nba_age_curve.pca import attach_scores, fit_season_pca
 from nba_age_curve.projection import peer_percentiles, project_metric
 from nba_age_curve.similarity import (
+    TargetNotComparable,
     CENTROID,
     EPSILON,
     STANDARD,
@@ -189,7 +190,16 @@ st.caption(
 )
 
 cols = st.columns(4)
-cols[0].metric("Seasons played", career_length)
+# For a player whose record starts mid-career, the career span in years and
+# the number of seasons actually present here are different numbers.
+if int(player["observed"]) != career_length:
+    cols[0].metric(
+        "Seasons in data",
+        int(player["observed"]),
+        help=f"Career spans {career_length} years; the rest predate the data.",
+    )
+else:
+    cols[0].metric("Seasons played", career_length)
 cols[1].metric("Status", "Active" if is_active else "Retired")
 cols[2].metric("Age range", f"{int(history['Age'].min())}–{int(history['Age'].max())}")
 # Totals only make sense for counting stats; rates are averaged instead.
@@ -198,12 +208,15 @@ if metric in RATE_METRICS:
 else:
     cols[3].metric(f"Career {metric}", f"{history[metric].sum():.1f}")
 
+first_career_year = int(history["Season_No"].min())
 if player["left_censored"]:
     st.warning(
-        f"**{player['PLAYER_NAME']} was already in the league before 1979-80**, "
-        "where this dataset begins. Their earlier seasons are missing, so "
-        '"career season 1" here is not their real rookie year and the '
-        "comparisons are matched against the wrong stage of their career.",
+        f"**{player['PLAYER_NAME']} debuted in "
+        f"{int(history['debut_year'].iloc[0])}**, before this dataset begins. "
+        f"Their record here starts at career year {first_career_year}, which "
+        "is where their seasons are correctly plotted — but their first "
+        f"{first_career_year - 1} years are missing, so there is no early "
+        "career to match on and comparisons are unavailable.",
         icon="⚠️",
     )
 
@@ -211,8 +224,8 @@ if player["left_censored"]:
 if is_active:
     default_cutoff = career_length
     cutoff_help = (
-        "Comparisons are built on the player's first N seasons, and the "
-        "projection starts from season N. Lower it to see what the model "
+        "Comparisons are built on the player's first N career years, and the "
+        "projection starts from year N. Lower it to see what the model "
         "would have said earlier."
     )
 else:
@@ -224,7 +237,7 @@ else:
 
 if career_length > 1:
     cutoff = st.slider(
-        "Build comparisons from the first N career seasons",
+        "Build comparisons from the first N career years",
         min_value=1,
         max_value=career_length,
         value=default_cutoff,
@@ -259,7 +272,11 @@ if not enabled:
 
 matches, projections = {}, {}
 for method in enabled:
-    match = get_match(method, int(player_id), cutoff, k, epsilon)
+    try:
+        match = get_match(method, int(player_id), cutoff, k, epsilon)
+    except TargetNotComparable as exc:
+        st.info(f"**{method}** \u2014 {exc}", icon="\u2139\ufe0f")
+        continue
     matches[method] = match
     for note in match.warnings:
         st.warning(f"**{method}** — {note}", icon="⚠️")
@@ -404,7 +421,7 @@ upper_x = max(
     + [max(p.seasons) for p in projections.values() if len(p)]
 )
 figure.update_layout(
-    xaxis_title="Season number in career",
+    xaxis_title="Career year",
     yaxis_title=PROJECTABLE_METRICS[metric],
     xaxis={"range": [0.5, upper_x + 0.5], "dtick": 1},
     hovermode="closest",
@@ -444,7 +461,7 @@ if projections:
 
 st.subheader("Most similar players")
 st.caption(
-    f"Matched on the first {cutoff} season{'s' if cutoff != 1 else ''} of each "
+    f"Matched on the first {cutoff} career year{'s' if cutoff != 1 else ''} of each "
     f"career, against the {matches[enabled[0]].pool_size:,} players who also "
     f"reached season {cutoff}."
 )
@@ -476,7 +493,7 @@ for tab, method in zip(tabs, enabled):
                 ),
                 "Censored": st.column_config.TextColumn(
                     "Pre-1980",
-                    help="This player debuted before the data starts, so their career season numbers are not their real ones.",
+                    help="This player debuted before the data starts, so their early seasons are missing.",
                 ),
             },
         )
@@ -527,10 +544,12 @@ starts at the player's actual current value. So the projection inherits the
 - Support thins out fast. Hover any projected point to see how many comparison
   players are still behind it; the sidebar's minimum-support slider cuts the
   line off once it gets too thin.
-- `Season_No` counts *seasons played*, not years elapsed, so a missed season is
-  collapsed rather than represented as a gap.
-- Players who debuted before 1979-80 are flagged wherever they appear, because
-  the data cannot see their real early careers.
+- Career year counts *years since the player's true debut*, taken from the
+  master record, so a missed season leaves a real gap in the index rather than
+  being collapsed. 660 players have at least one.
+- Players who debuted before 1979-80 are placed correctly on the career-year
+  axis, but their first seasons are missing, so they are excluded from
+  comparison pools rather than being matched at the wrong career stage.
 - Style similarity is not quality similarity. Two players can occupy the same
   point in this space and be very different players; the model has no idea who
   is good.

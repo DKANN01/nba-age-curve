@@ -7,7 +7,7 @@ PROJECT_ROOT = PACKAGE_ROOT.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 DATASET_PATH = DATA_DIR / "player_seasons.parquet"
-PRE_1980_PATH = DATA_DIR / "pre_1980_debuts.csv"
+DEBUT_PATH = DATA_DIR / "debut_years.csv"
 
 # Source of truth for the raw data. `scripts/build_dataset.py` turns this into
 # the parquet file that the app actually reads.

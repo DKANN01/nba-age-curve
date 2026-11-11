@@ -7,6 +7,7 @@ PROJECT_ROOT = PACKAGE_ROOT.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 DATASET_PATH = DATA_DIR / "player_seasons.parquet"
+GAMM_PATH = DATA_DIR / "gamm_model.npz"
 PRE_1980_PATH = DATA_DIR / "pre_1980_debuts.csv"
 
 # Source of truth for the raw data. `scripts/build_dataset.py` turns this into
@@ -65,3 +66,21 @@ DEFAULT_EPSILON = 0.9
 #: The first season present in the source data. Players already in the league
 #: before this point have truncated careers (see `data.flag_left_censored`).
 FIRST_SEASON = "1979-80"
+
+
+#: Smooth terms for the GAMM, as (column, number of knots). Age carries the
+#: aging curve; Season_No separates experience from age (debut ages vary by
+#: several years); SEASON_YEAR absorbs era; the PCs let the curve depend on
+#: playing style.
+GAMM_SMOOTHS = [
+    ("Age", 10),
+    ("Season_No", 8),
+    ("SEASON_YEAR", 8),
+    ("PC1", 8),
+    ("PC2", 8),
+    ("PC3", 6),
+    ("PC4", 6),
+]
+
+#: Label for the GAMM wherever methods are listed side by side.
+GAMM_METHOD = "GAMM"

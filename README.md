@@ -57,6 +57,99 @@ actual current value.
 So the projection inherits the **shape** of its comparisons' careers, never
 their level. A player outperforming all their comps keeps that gap.
 
+
+## The GAMM forecaster
+
+The comparison-based projection above is the classic "delta method" from the
+aging-curve literature: differencing cancels the player-level effect, which is
+why it is a sensible starting point. But it anchors entirely on one season, it
+accumulates error like a random walk, and it does no pooling.
+
+The GAMM (`nba_age_curve/gamm.py`) is an additive model with penalized smooth
+curves in age, career season, era and the four style components, plus a **random
+intercept for every player**:
+
+```
+ws_ij = a + f_age(age) + f_exp(season_no) + f_era(year) + sum_k f_k(PC_k) + b_i + e_ij
+b_i ~ N(0, sigma_b^2)   e_ij ~ N(0, sigma_e^2)
+```
+
+Fitted on all 20,546 player-seasons: **sigma_b = 0.90** (spread of player
+levels), **sigma_e = 1.50** (season-to-season noise), **peak age 27**.
+
+**Why the random intercept is the whole point.** Raw average win shares by age
+rise into the late twenties and barely fall afterwards — a 40-year-old looks as
+good as a 23-year-old. That is survivorship: only the good ones are still
+playing at 40. The random intercept absorbs each player's own level, so the age
+curve is estimated from *within-player* change:
+
+| age | 21 | 24 | 27 | 30 | 33 | 36 | 39 |
+|---|---|---|---|---|---|---|---|
+| raw mean (survivor-biased) | -1.4 | -1.1 | -0.2 | -0.1 | -0.4 | -0.7 | -1.1 |
+| within-player (GAMM) | -0.7 | -0.4 | 0.0 | -0.2 | -0.5 | -1.0 | -1.5 |
+
+**Forecasting a player** estimates their level from the seasons you have and
+shrinks it toward the population curve by `n / (n + sigma_e^2/sigma_b^2)` =
+`n / (n + 2.8)`. Three noisy seasons get pulled most of the way back to average;
+twelve seasons keep nearly all of their own level.
+
+### Does it actually help?
+
+`scripts/backtest.py` splits players by identity — the GAMM never sees a test
+player, and the k-NN methods may only draw comparisons from training players.
+Each method sees a player's first *N* seasons and forecasts the rest. Mean
+absolute error in win shares, over 3 cutoffs x 2 seeds:
+
+| Method | MAE | RMSE | bias |
+|---|---|---|---|
+| **GAMM** | **1.33** | 1.75 | +0.14 |
+| League-avg delta *(baseline)* | 2.23 | 2.99 | 0.00 |
+| epsilon-neighbourhood | 2.37 | 3.20 | -0.09 |
+| Standard k-NN | 2.53 | 3.36 | +0.05 |
+| Centroid k-NN | 2.55 | 3.42 | -0.09 |
+| Flat, carry last *(baseline)* | 2.68 | 3.55 | +1.74 |
+
+Two things to take from this:
+
+1. The GAMM roughly **halves** the error, and its advantage *grows* with
+   horizon — the delta methods accumulate error like a random walk while the
+   GAMM is anchored to a population curve. Its 80% prediction intervals cover
+   78.4% of outcomes (50% -> 51.5%, 95% -> 92.3%).
+2. **All three comparison methods lose to the league-average delta baseline.**
+   The similarity machinery is genuinely interesting for the question "who plays
+   like this player", but as a *forecaster* it adds nothing over applying the
+   population aging curve. The PCA is still doing real work — it enters the
+   GAMM as covariates, and dropping the style terms moves sigma_b from 0.90 to
+   1.80 — it is the nearest-neighbour step that does not pay for itself.
+
+The implementation was cross-checked against R's `mgcv`, the reference GAMM
+package. Fitting the same specification with `bam()` gives sigma_b = 0.9043
+(CI 0.870-0.939) and sigma_e = 1.4708, against 0.901 and 1.497 here.
+
+### Limits
+
+- **One level per career.** The random intercept is constant, so a player who
+  improved a lot has it dragged down by their rookie years and looks
+  under-forecast from their peak (Jokic is the obvious case). A random *slope*
+  per player is the natural next step.
+- **No retirement model.** Every method here forecasts performance *conditional
+  on still playing*, and retirement is strongly performance-related — a final
+  season averages 0.67 win shares against 3.07 otherwise. Expected career value
+  needs a companion hazard model.
+- **Smoothing parameters** are chosen by GCV with Nelder-Mead, which sometimes
+  drives a lambda to zero (an unpenalized smooth). It does not hurt the held-out
+  numbers, but REML would be the more principled choice.
+
+### Rebuilding it
+
+```bash
+python scripts/fit_gamm.py        # writes data/gamm_model.npz (30 KB)
+python scripts/backtest.py        # reproduces the table above
+```
+
+The app loads the saved `.npz` and only evaluates basis functions, so nothing is
+re-fit at runtime.
+
 ## What to distrust
 
 - **It anchors on a single season.** One injury year or one career year
@@ -125,13 +218,17 @@ nba_age_curve/
   config.py                 Feature list, paths, model defaults
   data.py                   Loading, season indexing, censoring flags, labels
   pca.py                    SeasonPCA: fit, transform, loadings, scree inputs
+  gamm.py                   Penalized splines + player random intercept
   similarity.py             The three matchers
   projection.py             Year-over-year delta projection, league percentiles
 scripts/
   build_dataset.py          Google Sheet -> data/player_seasons.parquet
   analysis.py               Exploratory PCA figures and component extremes
+  fit_gamm.py               Fits the GAMM -> data/gamm_model.npz
+  backtest.py               Scores every forecaster on held-out players
 data/
   player_seasons.parquet    Baked dataset (committed)
+  gamm_model.npz            Fitted GAMM coefficients (committed)
   pre_1980_debuts.csv       Confirmed pre-1980 debuts, for the censoring flag
 ```
 

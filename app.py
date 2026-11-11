@@ -7,6 +7,7 @@ Run locally with:
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -19,7 +20,9 @@ from nba_age_curve.config import (
     PROJECTABLE_METRICS,
     RATE_METRICS,
 )
+from nba_age_curve.config import GAMM_METHOD, GAMM_PATH, PC_COLS
 from nba_age_curve.data import load_player_seasons, player_directory
+from nba_age_curve.gamm import GAMM
 from nba_age_curve.pca import attach_scores, fit_season_pca
 from nba_age_curve.projection import peer_percentiles, project_metric
 from nba_age_curve.similarity import (
@@ -37,8 +40,28 @@ st.set_page_config(
     layout="wide",
 )
 
-METHOD_COLORS = {STANDARD: "#4C72B0", CENTROID: "#DD8452", EPSILON: "#55A868"}
-METHOD_DASHES = {STANDARD: "dash", CENTROID: "dot", EPSILON: "dashdot"}
+METHOD_COLORS = {
+    STANDARD: "#4C72B0",
+    CENTROID: "#DD8452",
+    EPSILON: "#55A868",
+    GAMM_METHOD: "#8172B2",
+}
+METHOD_DASHES = {
+    STANDARD: "dash",
+    CENTROID: "dot",
+    EPSILON: "dashdot",
+    GAMM_METHOD: "solid",
+}
+
+#: Mean absolute error on held-out retired players, from the backtest in
+#: `scripts/backtest.py`. Shown in the UI so the methods are not presented as
+#: equally trustworthy when they measurably are not.
+BACKTEST_MAE = {
+    GAMM_METHOD: 1.33,
+    EPSILON: 2.37,
+    STANDARD: 2.53,
+    CENTROID: 2.55,
+}
 
 
 def rgba(hex_color: str, alpha: float) -> str:
@@ -77,6 +100,14 @@ def get_match(method: str, player_id: int, n_seasons: int, k: int, epsilon: floa
     return match_epsilon(df, player_id, n_seasons, epsilon=epsilon)
 
 
+@st.cache_resource(show_spinner=False)
+def get_gamm():
+    """The pre-fitted GAMM, or None if `scripts/fit_gamm.py` has not been run."""
+    if not GAMM_PATH.exists():
+        return None
+    return GAMM.load(GAMM_PATH)
+
+
 @st.cache_data(show_spinner=False)
 def get_percentiles(metric: str) -> pd.DataFrame:
     df, _ = get_model_and_data()
@@ -103,10 +134,33 @@ with st.sidebar:
         format_func=lambda c: PROJECTABLE_METRICS[c],
     )
 
-    st.subheader("Matching methods")
-    use_standard = st.checkbox(STANDARD, value=True)
-    use_centroid = st.checkbox(CENTROID, value=True)
-    use_epsilon = st.checkbox(EPSILON, value=True)
+    st.subheader("Forecast methods")
+    gamm_model = get_gamm()
+    use_gamm = st.checkbox(
+        f"{GAMM_METHOD} (MAE {BACKTEST_MAE[GAMM_METHOD]})",
+        value=gamm_model is not None,
+        disabled=gamm_model is None,
+        help=(
+            "Additive model: smooth curves in age, experience, era and playing "
+            "style, plus a per-player random intercept. Only available for the "
+            "win-shares metric it was fit on."
+        ),
+    )
+    if gamm_model is None:
+        st.caption("Run `python scripts/fit_gamm.py` to enable the GAMM.")
+
+    st.caption("Comparison-based (MAE in brackets):")
+    use_standard = st.checkbox(f"{STANDARD} ({BACKTEST_MAE[STANDARD]})", value=True)
+    use_centroid = st.checkbox(f"{CENTROID} ({BACKTEST_MAE[CENTROID]})", value=True)
+    use_epsilon = st.checkbox(f"{EPSILON} ({BACKTEST_MAE[EPSILON]})", value=True)
+
+    gamm_horizon = st.slider(
+        "GAMM seasons to project",
+        min_value=1,
+        max_value=15,
+        value=8,
+        help="The GAMM projects to a chosen horizon or age 40, whichever comes first.",
+    )
 
     k = st.slider(
         "Comparisons per k-NN method",
@@ -162,9 +216,11 @@ with st.sidebar:
 
 st.title("NBA Career Projections")
 st.markdown(
-    "Pick a player to see the most stylistically similar careers in the "
-    "modern era, and where three different comparison methods project their "
-    f"**{PROJECTABLE_METRICS[metric].lower()}** going forward."
+    "Pick a player to see the most stylistically similar careers in the modern "
+    f"era, and where four methods project their "
+    f"**{PROJECTABLE_METRICS[metric].lower()}** going forward. The bracketed "
+    "numbers are each method's mean absolute error on held-out players — "
+    "lower is better, and they are not close."
 )
 
 preferred = directory.loc[directory["PLAYER_NAME"] == "Nikola Jokic", "PLAYER_ID"]
@@ -253,9 +309,35 @@ enabled = [
     if on
 ]
 
-if not enabled:
-    st.error("Enable at least one matching method in the sidebar.")
+show_gamm = bool(use_gamm and gamm_model is not None)
+if show_gamm and metric != DEFAULT_METRIC:
+    st.info(
+        f"The GAMM was fit on {PROJECTABLE_METRICS[DEFAULT_METRIC].lower()}, so "
+        f"it is not shown for {PROJECTABLE_METRICS[metric].lower()}. Re-run "
+        f"`scripts/fit_gamm.py --metric {metric}` to fit it for this one.",
+        icon="ℹ️",
+    )
+    show_gamm = False
+
+if not enabled and not show_gamm:
+    st.error("Enable at least one forecast method in the sidebar.")
     st.stop()
+
+# The GAMM needs no comparison set: it carries the player's own level forward
+# along a population aging curve, so it is computed on its own.
+gamm_forecast = None
+if show_gamm:
+    hist = history[history["Season_No"] <= cutoff]
+    future = GAMM.future_frame(hist, n_ahead=gamm_horizon, pc_cols=PC_COLS)
+    if len(future):
+        mean, sd = gamm_model.forecast(hist, future, y_col=metric)
+        gamm_forecast = (future["Season_No"].to_numpy(), mean, sd)
+    else:
+        st.info(
+            f"{player['PLAYER_NAME']} is already past the model's age-40 "
+            "horizon, so there is nothing left to project.",
+            icon="ℹ️",
+        )
 
 matches, projections = {}, {}
 for method in enabled:
@@ -392,6 +474,48 @@ for method, projection in projections.items():
         )
     )
 
+if gamm_forecast is not None:
+    gs, gmean, gsd = gamm_forecast
+    color = METHOD_COLORS[GAMM_METHOD]
+    anchor_x = float(history.loc[history["Season_No"] == cutoff, "Season_No"].iloc[0])
+    anchor_y = float(history.loc[history["Season_No"] == cutoff, metric].iloc[0])
+    xs = np.concatenate([[anchor_x], gs])
+    ys = np.concatenate([[anchor_y], gmean])
+
+    if show_band:
+        # 80% interval; backtested coverage is 78.6%.
+        lo = np.concatenate([[anchor_y], gmean - 1.2816 * gsd])
+        hi = np.concatenate([[anchor_y], gmean + 1.2816 * gsd])
+        figure.add_trace(
+            go.Scatter(
+                x=np.concatenate([xs, xs[::-1]]),
+                y=np.concatenate([hi, lo[::-1]]),
+                fill="toself",
+                fillcolor=rgba(color, 0.15),
+                mode="lines",
+                line={"width": 0},
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    figure.add_trace(
+        go.Scatter(
+            x=xs,
+            y=ys,
+            mode="lines+markers",
+            line={"color": color, "width": 3.5},
+            marker={"size": 7, "symbol": "diamond"},
+            name=f"{GAMM_METHOD} (MAE {BACKTEST_MAE[GAMM_METHOD]})",
+            customdata=np.concatenate([[0.0], gsd]),
+            hovertemplate=(
+                "Season %{x}: %{y:.1f}"
+                "<br>±1 SD: %{customdata:.1f}"
+                f"<extra>{GAMM_METHOD}</extra>"
+            ),
+        )
+    )
+
 figure.add_vline(
     x=cutoff,
     line={"color": "#999999", "width": 1, "dash": "dot"},
@@ -402,6 +526,7 @@ figure.add_vline(
 upper_x = max(
     [career_length]
     + [max(p.seasons) for p in projections.values() if len(p)]
+    + ([int(gamm_forecast[0].max())] if gamm_forecast is not None else [])
 )
 figure.update_layout(
     xaxis_title="Season number in career",
@@ -412,10 +537,23 @@ figure.update_layout(
     legend={"orientation": "h", "yanchor": "bottom", "y": 1.04, "x": 0},
     margin={"l": 60, "r": 30, "t": 90, "b": 50},
 )
-st.plotly_chart(figure, use_container_width=True)
+st.plotly_chart(figure, width="stretch")
 
-if projections:
+if projections or gamm_forecast is not None:
     summary = []
+    if gamm_forecast is not None:
+        gs, gmean, gsd = gamm_forecast
+        row = {
+            "Method": GAMM_METHOD,
+            "Seasons projected": len(gs),
+            "Next season": round(float(gmean[0]), 2),
+            "Final projected": round(float(gmean[-1]), 2),
+        }
+        if metric not in RATE_METRICS:
+            row["Remaining total"] = round(float(gmean.sum()), 1)
+        row["Backtest MAE"] = BACKTEST_MAE[GAMM_METHOD]
+        summary.append(row)
+
     for method, projection in projections.items():
         if len(projection) == 0:
             continue
@@ -429,10 +567,11 @@ if projections:
         if metric not in RATE_METRICS:
             row["Remaining total"] = round(sum(projection.values), 1)
         row["Thinnest support"] = min(projection.neighbors_used)
+        row["Backtest MAE"] = BACKTEST_MAE[method]
         summary.append(row)
     if summary:
         st.dataframe(
-            pd.DataFrame(summary), hide_index=True, use_container_width=True
+            pd.DataFrame(summary), hide_index=True, width="stretch"
         )
     else:
         st.caption("No seasons could be projected at the current settings.")
@@ -442,14 +581,15 @@ if projections:
 # Comparison tables
 # --------------------------------------------------------------------------
 
-st.subheader("Most similar players")
-st.caption(
-    f"Matched on the first {cutoff} season{'s' if cutoff != 1 else ''} of each "
-    f"career, against the {matches[enabled[0]].pool_size:,} players who also "
-    f"reached season {cutoff}."
-)
+if enabled:
+    st.subheader("Most similar players")
+    st.caption(
+        f"Matched on the first {cutoff} season{'s' if cutoff != 1 else ''} of each "
+        f"career, against the {matches[enabled[0]].pool_size:,} players who also "
+        f"reached season {cutoff}."
+    )
 
-tabs = st.tabs(enabled)
+tabs = st.tabs(enabled) if enabled else []
 for tab, method in zip(tabs, enabled):
     with tab:
         match = matches[method]
@@ -469,7 +609,7 @@ for tab, method in zip(tabs, enabled):
         st.dataframe(
             table[["Player", "Distance", "Weight", "Seasons", "Span", "Censored"]],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "Weight": st.column_config.NumberColumn(
                     help="Share of the projection this player drives (1/distance, normalized)."
@@ -514,11 +654,31 @@ differently, so treat agreement between them as the signal:
   few or none, which is the honest answer where k-NN would hand back five
   distant players and call them neighbours.
 
-**The projection is a path of changes, not levels.** For each future season the
-model takes the year-over-year change each comparison player made at that point
-in *their* career, weights it by 1/distance, and adds it to a running total that
-starts at the player's actual current value. So the projection inherits the
+**The comparison-based projection is a path of changes, not levels.** For each
+future season it takes the year-over-year change each comparison player made at
+that point in *their* career, weights it by 1/distance, and adds it to a running
+total that starts at the player's actual current value. So it inherits the
 *shape* of its comparisons' careers, never their level.
+
+**The GAMM works differently, and forecasts about twice as well.** It is an
+additive model with penalized smooth curves in age, career season, era and
+playing style, plus a random intercept for every player. Two things follow:
+
+- *It separates the aging curve from the player.* Raw average win shares by age
+  barely fall after 30, which would say players hardly decline. That is
+  survivorship — only the good ones are still playing at 36. The random
+  intercept absorbs each player's own level so the age curve is estimated from
+  *within-player* change. Peak age comes out at 27.
+- *It pools partially.* A player's level is estimated from their seasons and
+  shrunk toward the population curve by `n / (n + 2.8)`, so a player
+  with three noisy seasons is pulled most of the way back to average while one
+  with twelve keeps nearly all of their own level. The comparison-based methods
+  have no equivalent: they anchor 100% on a single season.
+
+On held-out retired players the GAMM's mean absolute error is **1.33 win
+shares** against **2.53** / **2.55** / **2.37** for the three comparison
+methods — all three of which also lose to simply applying the league-average
+year-over-year change (**2.23**). Its 80% intervals cover 78% of outcomes.
 
 **Where to be sceptical.**
 
@@ -534,5 +694,13 @@ starts at the player's actual current value. So the projection inherits the
 - Style similarity is not quality similarity. Two players can occupy the same
   point in this space and be very different players; the model has no idea who
   is good.
+- The GAMM gives each player a single level for their whole career, so a player
+  who improved a lot has that level dragged down by their rookie years and will
+  look under-forecast from their peak. A random *slope* per player would fix
+  this; it is not in yet.
+- Every method here forecasts performance **conditional on still playing**.
+  None of them models retirement, and retirement is strongly tied to
+  performance — a player's final season averages 0.7 win shares against 3.1
+  otherwise. Expected value over a career needs a hazard model on top.
 """
     )

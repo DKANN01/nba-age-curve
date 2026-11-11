@@ -1,0 +1,7 @@
+# Runtime dependencies for the Streamlit dashboard (app.py).
+streamlit>=1.40
+pandas>=1.5
+numpy>=1.23
+scikit-learn>=1.2
+pyarrow>=12
+plotly>=5.18

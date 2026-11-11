@@ -1,0 +1,4 @@
+# Additional dependencies for rebuilding the dataset and regenerating figures.
+-r requirements.txt
+openpyxl>=3.1   # scripts/build_dataset.py reads the source .xlsx
+matplotlib>=3.6 # scripts/analysis.py writes the PCA figures

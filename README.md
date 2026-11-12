@@ -43,9 +43,11 @@ The ε method exists because k-NN always hands back exactly *k* players, however
 distant. For a player with no real comparisons, returning two matches — or none
 — is the honest answer.
 
-A player is only matched against others who **also reached season *N***, so
+A player is only matched against others who **also reached career year *N***, so
 someone five seasons in is compared to other players' first five seasons rather
-than to careers that ended after two.
+than to careers that ended after two. Full coverage of that window is not
+required — a player whose record starts partway through contributes the part
+that was recorded (see left-censoring below).
 
 ### The projection is a path of changes, not levels
 
@@ -71,9 +73,13 @@ their level. A player outperforming all their comps keeps that gap.
   rather than being collapsed; 660 players have at least one.
 - **Pre-1980 debuts are left-censored.** 237 players were already in the league
   when the data starts. Their seasons sit correctly on the career-year axis,
-  but their early years are missing, so they are excluded from comparison
-  pools rather than matched at the wrong career stage, and cannot themselves
-  be used as a comparison target.
+  but their early years are missing, so they are matched on whatever part of
+  the window was recorded — Robert Parish's record begins at career year 4, so
+  at *N* = 5 he is matched on two seasons where his peers get five. The
+  "Matched on" column reports this. A player whose record starts *after*
+  career year *N* contributes nothing at that cutoff and cannot be a target
+  there: Kareem Abdul-Jabbar's record begins at career year 11, so he needs a
+  cutoff of 11 or more.
 - **Style similarity is not quality similarity.** Two players can sit at the
   same point in this space and be very different players. The model has no idea
   who is good — it only knows who plays alike.

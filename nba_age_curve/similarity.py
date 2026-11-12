@@ -19,6 +19,11 @@ so they will not agree, and are not meant to:
     rather than a fixed count. A player with no close peers gets few or no
     matches, which is the honest answer; k-NN would return five distant ones
     and present them as neighbours anyway.
+
+In all three, "first *n* seasons" means career years up to *n* among players who
+reached career year *n*. Coverage of that window need not be complete: a player
+whose record starts partway through their career contributes the recorded part,
+and ``coverage`` on each match reports how many seasons that was.
 """
 
 from __future__ import annotations
@@ -68,21 +73,22 @@ class NeighborMatch:
 
 
 class TargetNotComparable(ValueError):
-    """The target has no observed early career, so "first n years" is undefined.
+    """The target has no observed season inside the matching window.
 
-    Raised for players who debuted before the dataset begins. Their later
-    seasons sit correctly on the career-year axis, but there is nothing to
-    match on, because the window every other player is compared over simply
-    was not recorded for them.
+    Raised for players who debuted before the dataset begins by more than the
+    window length -- Kareem Abdul-Jabbar's record starts at career year 11, so
+    at a cutoff of 5 there is nothing of his to match on. A censored player
+    whose record *does* reach into the window is matched on the part of it that
+    was recorded.
     """
 
 
 def _require_in_pool(frame: pd.DataFrame, target_id: int, n_seasons: int) -> None:
     if target_id not in set(frame["PLAYER_ID"]):
         raise TargetNotComparable(
-            f"This player's record starts partway through their career, so "
-            f"their first {n_seasons} years are not in the data and cannot be "
-            f"compared."
+            f"This player's record starts after career year {n_seasons}, so "
+            f"none of the first {n_seasons} years are in the data. Raise the "
+            f"cutoff to reach the seasons that were recorded."
         )
 
 
@@ -96,7 +102,7 @@ def _target_n_seasons(df: pd.DataFrame, target_id: int) -> int:
 def _decorate(
     neighbors: pd.DataFrame, lookup: pd.DataFrame, df: pd.DataFrame
 ) -> pd.DataFrame:
-    """Attach display fields (label, total seasons, censoring flag)."""
+    """Attach display fields (label, total seasons, censoring flag, coverage)."""
     careers = df.groupby("PLAYER_ID").agg(
         label=("label", "first"),
         PLAYER_NAME=("PLAYER_NAME", "first"),
@@ -105,9 +111,12 @@ def _decorate(
         first_season=("SEASON", "min"),
         last_season=("SEASON", "max"),
     )
-    return neighbors.merge(
-        careers, left_on="PLAYER_ID", right_index=True, how="left"
-    ).sort_values("distance")
+    out = neighbors.merge(careers, left_on="PLAYER_ID", right_index=True, how="left")
+    if "coverage" in lookup.columns:
+        out = out.merge(
+            lookup[["PLAYER_ID", "coverage"]], on="PLAYER_ID", how="left"
+        )
+    return out.sort_values("distance")
 
 
 def _knn_query(
@@ -170,9 +179,17 @@ def match_standard_knn(
 
 
 def _centroids(df: pd.DataFrame, n_seasons: int) -> pd.DataFrame:
-    """Mean global-PC coordinates over each eligible player's first n seasons."""
+    """Mean global-PC coordinates over each eligible player's window.
+
+    The window is career years up to ``n_seasons``; ``coverage`` says how many
+    of them the player was actually observed for, which is fewer than
+    ``n_seasons`` for anyone whose record starts partway through.
+    """
     subset = first_n_seasons(df, n_seasons)
-    return subset.groupby("PLAYER_ID")[PC_COLS].mean().reset_index()
+    grouped = subset.groupby("PLAYER_ID")
+    centroids = grouped[PC_COLS].mean()
+    centroids["coverage"] = grouped["coverage"].first()
+    return centroids.reset_index()
 
 
 def match_centroid_knn(

@@ -134,18 +134,25 @@ def career_lengths(df: pd.DataFrame) -> pd.Series:
 
 
 def first_n_seasons(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    """Rows covering career years 1..``n`` for players observed over all of them.
+    """Rows at career year ``n`` or earlier, for players who reached year ``n``.
 
-    Two conditions, both needed for a fair comparison. The player must have
-    *reached* career year ``n``, so a target five years in is not matched
-    against careers that ended after two. And the player must be observed from
-    career year 1, which excludes anyone who debuted before this dataset
-    begins -- their early seasons are missing, so there is nothing to compare
-    against however the index is computed.
+    Reaching career year ``n`` is required, so a target five years in is not
+    matched against careers that ended after two. Coverage from career year 1
+    is *not* required: a player who debuted before this dataset begins
+    contributes whatever part of the window was recorded. Kareem
+    Abdul-Jabbar's record starts at career year 11, so at ``n=5`` he is still
+    absent, but Robert Parish starts at year 4 and contributes years 4-5.
+
+    The cost is uneven coverage. A left-censored player's window average is
+    taken over fewer seasons than a peer's -- sometimes a single one -- so it
+    is a noisier estimate of the same quantity. ``coverage`` records how many
+    seasons each player actually contributed.
     """
     span = df.groupby("PLAYER_ID")["Season_No"].agg(["min", "max"])
-    eligible = span.index[(span["min"] == 1) & (span["max"] >= n)]
-    return df[df["PLAYER_ID"].isin(eligible) & (df["Season_No"] <= n)]
+    eligible = span.index[(span["min"] <= n) & (span["max"] >= n)]
+    window = df[df["PLAYER_ID"].isin(eligible) & (df["Season_No"] <= n)].copy()
+    window["coverage"] = window.groupby("PLAYER_ID")["Season_No"].transform("size")
+    return window
 
 
 def aggregate_careers(df: pd.DataFrame, value_cols: list[str]) -> pd.DataFrame:
@@ -158,11 +165,14 @@ def aggregate_careers(df: pd.DataFrame, value_cols: list[str]) -> pd.DataFrame:
     agg = {c: "mean" for c in present}
     agg["Season_No"] = "max"
     out = df.groupby("PLAYER_ID").agg(agg)
-    meta = df.groupby("PLAYER_ID").agg(
-        PLAYER_NAME=("PLAYER_NAME", "first"),
-        label=("label", "first"),
-        left_censored=("left_censored", "max"),
-    )
+    meta_cols = {
+        "PLAYER_NAME": ("PLAYER_NAME", "first"),
+        "label": ("label", "first"),
+        "left_censored": ("left_censored", "max"),
+    }
+    if "coverage" in df.columns:
+        meta_cols["coverage"] = ("coverage", "first")
+    meta = df.groupby("PLAYER_ID").agg(**meta_cols)
     return meta.join(out).rename(columns={"Season_No": "Seasons"}).reset_index()
 
 

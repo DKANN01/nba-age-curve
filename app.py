@@ -215,8 +215,9 @@ if player["left_censored"]:
         f"{int(history['debut_year'].iloc[0])}**, before this dataset begins. "
         f"Their record here starts at career year {first_career_year}, which "
         "is where their seasons are correctly plotted — but their first "
-        f"{first_career_year - 1} years are missing, so there is no early "
-        "career to match on and comparisons are unavailable.",
+        f"{first_career_year - 1} years are missing. Comparisons are built "
+        "only from the seasons that were recorded, so a cutoff below career "
+        f"year {first_career_year} has nothing to match on.",
         icon="⚠️",
     )
 
@@ -461,9 +462,9 @@ if projections:
 
 st.subheader("Most similar players")
 st.caption(
-    f"Matched on the first {cutoff} career year{'s' if cutoff != 1 else ''} of each "
+    f"Matched on career year{'s' if cutoff != 1 else ''} 1–{cutoff} of each "
     f"career, against the {matches[enabled[0]].pool_size:,} players who also "
-    f"reached season {cutoff}."
+    f"reached career year {cutoff}."
 )
 
 tabs = st.tabs(enabled)
@@ -481,26 +482,34 @@ for tab, method in zip(tabs, enabled):
             Weight=lambda t: (
                 (1 / (t["distance"] + 1e-5)) / (1 / (t["distance"] + 1e-5)).sum()
             ).round(3),
-            Censored=lambda t: t["left_censored"].map({True: "⚠️", False: ""}),
+            Matched=lambda t: t["coverage"].astype(int),
         )
         st.dataframe(
-            table[["Player", "Distance", "Weight", "Seasons", "Span", "Censored"]],
+            table[["Player", "Distance", "Weight", "Seasons", "Span", "Matched"]],
             hide_index=True,
             use_container_width=True,
             column_config={
                 "Weight": st.column_config.NumberColumn(
                     help="Share of the projection this player drives (1/distance, normalized)."
                 ),
-                "Censored": st.column_config.TextColumn(
-                    "Pre-1980",
-                    help="This player debuted before the data starts, so their early seasons are missing.",
+                "Matched": st.column_config.NumberColumn(
+                    "Matched on",
+                    help=(
+                        f"Seasons inside the career-year 1–{cutoff} window "
+                        "this player was actually observed for. Fewer than "
+                        f"{cutoff} means a missed season, or a career that "
+                        "began before 1979-80."
+                    ),
                 ),
             },
         )
-        if (match.neighbors["left_censored"]).any():
+        thin = match.neighbors[match.neighbors["coverage"] < cutoff]
+        if not thin.empty:
             st.caption(
-                "⚠️ Flagged players were already in the league before "
-                "1979-80, so they are being compared at the wrong career stage."
+                f"{len(thin)} of these players were observed for fewer than "
+                f"{cutoff} seasons in that window — a missed season, or a "
+                "career that began before 1979-80 — so their profile is "
+                "averaged over less."
             )
 
 
@@ -548,8 +557,10 @@ starts at the player's actual current value. So the projection inherits the
   master record, so a missed season leaves a real gap in the index rather than
   being collapsed. 660 players have at least one.
 - Players who debuted before 1979-80 are placed correctly on the career-year
-  axis, but their first seasons are missing, so they are excluded from
-  comparison pools rather than being matched at the wrong career stage.
+  axis, but their first seasons are missing. They are matched on whatever part
+  of the window *was* recorded, so their profile is averaged over fewer seasons
+  than a peer's — see the "Matched on" column. A player whose record starts
+  after career year N contributes nothing at that cutoff.
 - Style similarity is not quality similarity. Two players can occupy the same
   point in this space and be very different players; the model has no idea who
   is good.

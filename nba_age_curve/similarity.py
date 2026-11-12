@@ -18,7 +18,7 @@ so they will not agree, and are not meant to:
     The same global centroids, but returns every player inside a fixed radius
     rather than a fixed count. A player with no close peers gets few or no
     matches, which is the honest answer; k-NN would return five distant ones
-    and present them as neighbours anyway.
+    and present them as neighbors anyway.
 
 In all three, "first *n* seasons" means career years up to *n* among players who
 reached career year *n*. Coverage of that window need not be complete: a player
@@ -46,7 +46,7 @@ from nba_age_curve.pca import fit_season_pca
 
 STANDARD = "Standard k-NN"
 CENTROID = "Centroid k-NN"
-EPSILON = "ε-neighbourhood"
+EPSILON = "ε-neighborhood"
 
 
 @dataclass
@@ -123,7 +123,7 @@ def _knn_query(
     frame: pd.DataFrame, cols: list[str], target_id: int, k: int
 ) -> pd.DataFrame:
     """Nearest ``k`` rows to the target, excluding the target itself."""
-    # k + 1 because the target is always its own nearest neighbour at distance 0.
+    # k + 1 because the target is always its own nearest neighbor at distance 0.
     n_neighbors = min(k + 1, len(frame))
     knn = NearestNeighbors(n_neighbors=n_neighbors).fit(frame[cols])
     target_row = frame.index[frame["PLAYER_ID"] == target_id]

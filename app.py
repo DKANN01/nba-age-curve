@@ -123,7 +123,7 @@ with st.sidebar:
         value=float(DEFAULT_EPSILON),
         step=0.1,
         help=(
-            "The ε-neighbourhood returns every player within this distance "
+            "The ε-neighborhood returns every player within this distance "
             "in component space, however many that is."
         ),
     )
@@ -511,58 +511,3 @@ for tab, method in zip(tabs, enabled):
                 "career that began before 1979-80 — so their profile is "
                 "averaged over less."
             )
-
-
-# --------------------------------------------------------------------------
-# Method notes
-# --------------------------------------------------------------------------
-
-with st.expander("How this works, and what to distrust"):
-    st.markdown(
-        f"""
-**The style space.** Every player-season is described by {len(pca_model.features)}
-per-minute and ratio stats, z-scored so each counts equally, then reduced by PCA
-to {N_COMPONENTS} components (eigenvalue > 1, the Kaiser rule) holding
-{pca_model.explained_variance_ratio[:N_COMPONENTS].sum():.0%} of the variance.
-Broadly, PC1 separates bigs from guards, PC2 tracks scoring volume and usage,
-PC3 perimeter shooting, and PC4 defence and rebounding.
-
-**The three methods disagree on purpose.** They build the comparison space
-differently, so treat agreement between them as the signal:
-
-- *{STANDARD}* averages the raw stats over each player's first N seasons and
-  fits a **fresh PCA on just that peer group**, so the space changes with the
-  query.
-- *{CENTROID}* uses the one global PCA fit over all player-seasons and takes
-  each player's mean position across their first N seasons.
-- *{EPSILON}* uses those same global centroids but returns **everyone within a
-  radius** instead of a fixed count. If a player has no close peers it returns
-  few or none, which is the honest answer where k-NN would hand back five
-  distant players and call them neighbours.
-
-**The projection is a path of changes, not levels.** For each future season the
-model takes the year-over-year change each comparison player made at that point
-in *their* career, weights it by 1/distance, and adds it to a running total that
-starts at the player's actual current value. So the projection inherits the
-*shape* of its comparisons' careers, never their level.
-
-**Where to be sceptical.**
-
-- It anchors on a single season, so one injury year or one career year
-  propagates through the entire projection.
-- Support thins out fast. Hover any projected point to see how many comparison
-  players are still behind it; the sidebar's minimum-support slider cuts the
-  line off once it gets too thin.
-- Career year counts *years since the player's true debut*, taken from the
-  master record, so a missed season leaves a real gap in the index rather than
-  being collapsed. 660 players have at least one.
-- Players who debuted before 1979-80 are placed correctly on the career-year
-  axis, but their first seasons are missing. They are matched on whatever part
-  of the window *was* recorded, so their profile is averaged over fewer seasons
-  than a peer's — see the "Matched on" column. A player whose record starts
-  after career year N contributes nothing at that cutoff.
-- Style similarity is not quality similarity. Two players can occupy the same
-  point in this space and be very different players; the model has no idea who
-  is good.
-"""
-    )

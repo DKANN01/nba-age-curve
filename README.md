@@ -37,7 +37,7 @@ between them as the signal.
 |---|---|---|
 | **Standard k-NN** | Averages raw stats over each player's first *N* seasons, then fits a **fresh PCA on just that peer group** — the space changes with the query | *k* nearest |
 | **Centroid k-NN** | The one global season-level PCA; each player's mean position across their first *N* seasons | *k* nearest |
-| **ε-neighbourhood** | The same global centroids | **Everyone within radius ε** |
+| **ε-neighborhood** | The same global centroids | **Everyone within radius ε** |
 
 The ε method exists because k-NN always hands back exactly *k* players, however
 distant. For a player with no real comparisons, returning two matches — or none
@@ -173,5 +173,5 @@ the rewrite fixes several real bugs:
   "standard" refits PCA per query while the other two use the global space.
   That difference is preserved (it is a legitimate design choice) but is now
   documented in the code and surfaced in the app.
-- The projection loop re-scanned the full 20k-row table once per neighbour per
+- The projection loop re-scanned the full 20k-row table once per neighbor per
   season; it now builds a delta table once per projection.

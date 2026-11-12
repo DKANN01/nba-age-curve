@@ -73,7 +73,7 @@ def _delta_table(
     """Year-over-year change in ``metric`` per comparison player and season.
 
     Built once per projection rather than re-filtering the full table inside the
-    season loop, which is what made the original O(seasons x neighbours) in
+    season loop, which is what made the original O(seasons x neighbors) in
     full-table scans.
     """
     hist = df[df["PLAYER_ID"].isin(player_ids)][

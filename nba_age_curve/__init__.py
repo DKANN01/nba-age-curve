@@ -1,4 +1,4 @@
-"""PCA + nearest-neighbour career projections for NBA players."""
+"""PCA + nearest-neighbor career projections for NBA players."""
 
 from nba_age_curve.config import (
     DEFAULT_EPSILON,

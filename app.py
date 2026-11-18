@@ -248,6 +248,75 @@ else:
     cutoff = 1
     st.caption("This player has a single season, so comparisons use season 1.")
 
+# The projection adds peer deltas to the anchor season's level, so an injury
+# year at the cutoff shifts the entire path down without the comparison set
+# changing at all. Let the anchor be overridden independently of the cutoff.
+anchor_rows = history.loc[history["Season_No"] == cutoff, metric]
+observed_anchor = float(anchor_rows.iloc[0]) if len(anchor_rows) else float("nan")
+
+# The three seasons before the cutoff are the obvious reference for a
+# hand-entered level: they are the player's recent form with the cutoff's own
+# anomaly excluded.
+prior_window = history.loc[
+    history["Season_No"].between(cutoff - 3, cutoff - 1), ["Season_No", metric]
+].dropna(subset=[metric])
+
+override_anchor = st.checkbox(
+    "Set the starting value by hand",
+    value=False,
+    help=(
+        "The projection starts from the player's actual value in the cutoff "
+        "season and adds the comparison players' year-over-year changes to "
+        "it. If that season was shortened by injury the whole path inherits "
+        "the dip. Overriding the level leaves the shape untouched."
+    ),
+)
+
+anchor: float | None = None
+if override_anchor:
+    label = f"{PROJECTABLE_METRICS[metric]} to project from"
+    if pd.isna(observed_anchor):
+        st.caption(
+            f"{metric} is missing for career year {cutoff}; enter a value to "
+            "project anyway."
+        )
+        default_anchor = 0.0
+    else:
+        default_anchor = observed_anchor
+    reference = []
+    if not pd.isna(observed_anchor):
+        reference.append(
+            f"Actual {PROJECTABLE_METRICS[metric].lower()} in career year "
+            f"{cutoff} was {observed_anchor:.2f} "
+            f"({history.loc[history['Season_No'] == cutoff, 'SEASON'].iloc[0]})."
+        )
+    if len(prior_window):
+        years = "year" if len(prior_window) == 1 else "years"
+        span = (
+            f"career year {int(prior_window['Season_No'].iloc[0])}"
+            if len(prior_window) == 1
+            else f"career years {int(prior_window['Season_No'].iloc[0])}"
+            f"–{int(prior_window['Season_No'].iloc[-1])}"
+        )
+        reference.append(
+            f"The {len(prior_window)} {years} before it averaged "
+            f"{prior_window[metric].mean():.2f} ({span})."
+        )
+    anchor = float(
+        st.number_input(
+            label,
+            value=round(default_anchor, 2),
+            step=0.1 if metric in RATE_METRICS else 0.5,
+            format="%.2f",
+            help=(
+                "Only the height of the projection changes. The comparison "
+                "set, the weights and the shape of the path are unaffected."
+            ),
+        )
+    )
+    if reference:
+        st.caption(" ".join(reference))
+
 if not is_active and cutoff == career_length:
     st.info(
         "This player is retired and the cutoff is their final season, so there "
@@ -285,7 +354,8 @@ for method in enabled:
         continue
     try:
         projection = project_metric(
-            df, match, metric, cutoff=cutoff, min_support=min_support
+            df, match, metric, cutoff=cutoff, min_support=min_support,
+            anchor=anchor,
         )
     except ValueError as exc:
         st.warning(f"**{method}** — {exc}", icon="⚠️")
@@ -416,6 +486,27 @@ figure.add_vline(
     annotation_text="projection starts",
     annotation_position="top",
 )
+
+# With an overridden anchor the paths leave from a point that is not on the
+# actual line, which is confusing unless the substitution is drawn.
+if anchor is not None:
+    figure.add_trace(
+        go.Scatter(
+            x=[cutoff],
+            y=[anchor],
+            mode="markers",
+            marker={
+                "size": 13,
+                "symbol": "circle-open",
+                "line": {"width": 2.5, "color": "#111111"},
+            },
+            name="Starting value (set by hand)",
+            hovertemplate=(
+                f"Career year {cutoff}: %{{y:.2f}}"
+                "<extra>Starting value (set by hand)</extra>"
+            ),
+        )
+    )
 
 upper_x = max(
     [career_length]

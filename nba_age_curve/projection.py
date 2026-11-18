@@ -98,6 +98,7 @@ def project_metric(
     metric: str,
     cutoff: int | None = None,
     min_support: int = 1,
+    anchor: float | None = None,
 ) -> Projection:
     """Project ``metric`` forward for the player in ``match``.
 
@@ -109,21 +110,32 @@ def project_metric(
     ``min_support`` stops the path once fewer than that many comparison players
     still have data. With the default of 1 a long projection can end up riding
     on a single peer's career; raising it to 2 or 3 trades length for evidence.
+
+    ``anchor`` replaces the value the path starts from. Because the projection
+    adds peer *changes* to the player's own level, that one season sets the
+    height of everything downstream -- so a year wrecked by injury drags the
+    whole forecast down even though the comparison set is unaffected. Supplying
+    a level the player is actually expected to return to asks the different and
+    usually more useful question: given this shape of career, where does he go
+    from a normal season? It changes only the starting height, never the shape.
     """
     cutoff = cutoff or match.n_seasons
-    target = df[df["PLAYER_ID"] == match.target_id]
-    anchor_rows = target[target["Season_No"] == cutoff]
-    if anchor_rows.empty:
-        raise ValueError(
-            f"Player has no season {cutoff} to project from "
-            f"(career is {int(target['Season_No'].max())} seasons)."
-        )
-    anchor_value = float(anchor_rows.iloc[0][metric])
-    if pd.isna(anchor_value):
-        raise ValueError(
-            f"{metric} is missing for season {cutoff}, so there is no value to "
-            "project from. Pick a different cutoff or metric."
-        )
+    if anchor is None:
+        target = df[df["PLAYER_ID"] == match.target_id]
+        anchor_rows = target[target["Season_No"] == cutoff]
+        if anchor_rows.empty:
+            raise ValueError(
+                f"Player has no season {cutoff} to project from "
+                f"(career is {int(target['Season_No'].max())} seasons)."
+            )
+        anchor_value = float(anchor_rows.iloc[0][metric])
+        if pd.isna(anchor_value):
+            raise ValueError(
+                f"{metric} is missing for season {cutoff}, so there is no value "
+                "to project from. Pick a different cutoff or metric."
+            )
+    else:
+        anchor_value = float(anchor)
 
     empty = Projection(match.method, metric, cutoff, anchor_value, [], [], [], [])
     if len(match) == 0:
